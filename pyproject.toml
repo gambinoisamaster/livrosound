@@ -1,0 +1,45 @@
+[project]
+name = "livrosound"
+version = "0.1.0"
+description = "LivroSound: turn a book (PDF, EPUB, DOCX, TXT) into narrated audio, read along with live highlighting. Fully local."
+requires-python = ">=3.12"
+dependencies = [
+    "pyside6>=6.11.1",
+    "pymupdf>=1.24",          # PDF text, geometry, outline and page rendering
+    "beautifulsoup4>=4.12",   # EPUB XHTML
+    "lxml>=5",
+    "python-docx>=1.1",       # DOCX
+    "num2words>=0.5",         # numbers read as words
+    "numpy>=1.26",
+    "pocket-tts>=2.1.0; sys_platform != 'darwin' or platform_machine == 'arm64'",
+    # Listed explicitly even though pocket-tts pulls it in: [tool.uv.sources] below
+    # applies only to DIRECT dependencies (keeps Linux on the CPU build).
+    "torch>=2.5; sys_platform != 'darwin' or platform_machine == 'arm64'",
+]
+
+[project.optional-dependencies]
+# Optional Whisper check of every generated sentence. Install with: uv sync --extra validate
+validate = [
+    "mlx-whisper>=0.4; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "faster-whisper>=1.2; sys_platform != 'darwin' or platform_machine != 'arm64'",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not slow'"  # real-model tests: uv run pytest -m slow
+markers = [
+    "slow: loads a real TTS/Whisper model or a real sample book (deselect with -m 'not slow')",
+]

@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 512 512" width="512" height="512">
+  <!-- LivroSound: an open hardcover book. Fern cover boards and spine, cream page fans,
+       lines of text on the left page and the same lines as a sound wave on the right.
+       Flat shapes only (Qt's SVG renderer has no filters); reads on light and dark backgrounds.
+       livrosound-app.svg puts this book on the macOS app-icon tile. -->
+  <defs>
+    <linearGradient id="gutter" x1="256" y1="0" x2="196" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#C2AF86" stop-opacity="0.6"/>
+      <stop offset="1" stop-color="#C2AF86" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <g transform="translate(0 -30)">
+    <g id="half">
+      <path d="M256 196 L40 166 L40 392 C130 386 206 396 256 420 Z" fill="#4F7942"/>
+      <path d="M256 180 C214 156 130 142 56 160 L56 378 C134 370 210 382 256 404 Z" fill="#E6D8B9"/>
+      <path d="M64 376 C138 368 211 379 256 400" fill="none" stroke="#CDB98F" stroke-width="2.5"/>
+      <path d="M256 180 C214 154 140 136 72 146 L72 364 C140 356 212 368 256 394 Z" fill="#FFFCF4"/>
+      <path d="M256 180 C236 168 222 160 196 152 L196 372 C222 376 240 384 256 394 Z" fill="url(#gutter)"/>
+      <path d="M256 180 C214 154 140 136 72 146" fill="none" stroke="#E2D3B1" stroke-width="3" stroke-linecap="round"/>
+    </g>
+    <use xlink:href="#half" transform="matrix(-1 0 0 1 512 0)"/>
+    <rect x="243" y="400" width="26" height="28" rx="9" fill="#3E6234"/>
+    <g fill="none" stroke="#DDD0B4" stroke-width="9" stroke-linecap="round">
+      <path d="M102 206 L218 206"/>
+      <path d="M102 238 L218 238"/>
+      <path d="M102 270 L218 270"/>
+      <path d="M102 302 L174 302"/>
+    </g>
+    <g fill="none" stroke="#4F7942" stroke-width="9" stroke-linecap="round">
+      <path d="M294 242 L294 266"/>
+      <path d="M312 230 L312 278"/>
+      <path d="M330 218 L330 290"/>
+      <path d="M348 234 L348 274"/>
+      <path d="M366 206 L366 302"/>
+      <path d="M384 224 L384 284"/>
+      <path d="M402 238 L402 270"/>
+      <path d="M420 246 L420 262"/>
+    </g>
+  </g>
+</svg>

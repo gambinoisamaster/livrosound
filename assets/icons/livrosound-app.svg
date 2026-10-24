@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- The macOS app icon: the book from livrosound.svg on a slate-indigo tile (the Original
+       theme's frame color), on Apple's 1024 grid (824 px tile, 100 px margin). The Dock PNG
+       (livrosound-1024.png) is rendered from this with a soft drop shadow added. -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="100" x2="0" y2="924" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2B3550"/>
+      <stop offset="1" stop-color="#161B28"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0" y1="100" x2="0" y2="520" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.10"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="gutter" x1="256" y1="0" x2="196" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#C2AF86" stop-opacity="0.6"/>
+      <stop offset="1" stop-color="#C2AF86" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#tile)"/>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#sheen)"/>
+  <rect x="101" y="101" width="822" height="822" rx="184" fill="none" stroke="#FFFFFF" stroke-opacity="0.08" stroke-width="2"/>
+  <g transform="translate(512 524) scale(1.36) translate(-256 -256)">
+    <g transform="translate(0 -30)">
+      <g id="half">
+        <path d="M256 196 L40 166 L40 392 C130 386 206 396 256 420 Z" fill="#5A8A4B"/>
+        <path d="M256 180 C214 156 130 142 56 160 L56 378 C134 370 210 382 256 404 Z" fill="#E6D8B9"/>
+        <path d="M64 376 C138 368 211 379 256 400" fill="none" stroke="#CDB98F" stroke-width="2.5"/>
+        <path d="M256 180 C214 154 140 136 72 146 L72 364 C140 356 212 368 256 394 Z" fill="#FFFCF4"/>
+        <path d="M256 180 C236 168 222 160 196 152 L196 372 C222 376 240 384 256 394 Z" fill="url(#gutter)"/>
+      </g>
+      <use xlink:href="#half" transform="matrix(-1 0 0 1 512 0)"/>
+      <rect x="243" y="400" width="26" height="28" rx="9" fill="#46703A"/>
+      <g fill="none" stroke="#DDD0B4" stroke-width="9" stroke-linecap="round">
+        <path d="M102 206 L218 206"/>
+        <path d="M102 238 L218 238"/>
+        <path d="M102 270 L218 270"/>
+        <path d="M102 302 L174 302"/>
+      </g>
+      <g fill="none" stroke="#4F7942" stroke-width="9" stroke-linecap="round">
+        <path d="M294 242 L294 266"/>
+        <path d="M312 230 L312 278"/>
+        <path d="M330 218 L330 290"/>
+        <path d="M348 234 L348 274"/>
+        <path d="M366 206 L366 302"/>
+        <path d="M384 224 L384 284"/>
+        <path d="M402 238 L402 270"/>
+        <path d="M420 246 L420 262"/>
+      </g>
+    </g>
+  </g>
+</svg>

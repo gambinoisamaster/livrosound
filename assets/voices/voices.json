@@ -1,0 +1,20 @@
+{
+  "_comment": "Cloned narrator voices. Each NAME has NAME.wav (10-20 s clean mono sample) and NAME.wav.txt (its transcript). 'source' is the file name the voice had in Script Radio.",
+  "Aaron":    {"gender": "male",   "age": "adult",  "source": "Default_Narrator_Male"},
+  "Ana":      {"gender": "female", "age": "adult",  "source": "Default_Narrator_Female"},
+  "Anne":     {"gender": "female", "age": "adult",  "source": "Anne_Female_Casual_Conversational"},
+  "Connor":   {"gender": "male",   "age": "adult",  "source": "Connor_Male_Adult_Aussie"},
+  "Danny":    {"gender": "male",   "age": "young",  "source": "Danny_Male_Young_Anxious"},
+  "Emily":    {"gender": "female", "age": "young",  "source": "Emily_Female_Young_Stoic"},
+  "Ethan":    {"gender": "male",   "age": "adult",  "source": "Ethan_Male_Manly_Rugged"},
+  "Gertrude": {"gender": "female", "age": "mature", "source": "Gertrude_Female_Mature_Wise"},
+  "Gigi":     {"gender": "female", "age": "young",  "source": "Gigi_Female_Young_Valley_Girl"},
+  "Johnny":   {"gender": "male",   "age": "adult",  "source": "Johnny_Male_Adult_Southern"},
+  "Kyle":     {"gender": "male",   "age": "young",  "source": "Kyle_Male_Young_Rebellious"},
+  "Liz":      {"gender": "female", "age": "young",  "source": "Liz_Female_Young_Aloof_Bratty"},
+  "Matthew":  {"gender": "male",   "age": "adult",  "source": "Matthew_Male_Southern_Pensive"},
+  "Ronald":   {"gender": "male",   "age": "mature", "source": "Ronald_Male_Mature_Imposing"},
+  "Ruth":     {"gender": "female", "age": "young",  "source": "Ruth_female_young_insecure"},
+  "Susan":    {"gender": "female", "age": "adult",  "source": "Susan_Female_voice"},
+  "Therese":  {"gender": "female", "age": "adult",  "source": "Therese_Female_Teacher_explainer_Patient"}
+}
