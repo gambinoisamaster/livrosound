@@ -49,7 +49,9 @@ from livrosound.audio_store import AudioStore
 from livrosound.timeline import Timeline
 
 SAMPLE_RATE = dsp.SAMPLE_RATE
-BUFFER_MS = 1000  # the output's buffer rides out a busy UI thread; pause and seek discard it anyway
+# The output's buffer rides out a busy UI thread (the pump refills it every 20 ms), but
+# it is also how far behind a pause could lag if the sink played it out: kept short.
+BUFFER_MS = 250
 PUMP_INTERVAL_MS = 20
 POSITION_INTERVAL_MS = 33  # position_changed ~30 times a second while playing
 MIN_RATE, MAX_RATE = 0.5, 2.0
@@ -106,6 +108,11 @@ class QtSinkOutput:
 
     def stop(self) -> None:
         if self._sink is not None:
+            # On macOS stop() alone lets the queued audio play out (~half a second): a pause
+            # lagged and a jump overlapped the old line with the new one. Mute and drop the
+            # buffer first, so it goes quiet the moment the user asks.
+            self._sink.setVolume(0.0)
+            self._sink.reset()
             self._sink.stop()
             self._sink.deleteLater()
             self._sink = None

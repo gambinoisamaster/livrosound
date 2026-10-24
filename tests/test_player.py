@@ -563,3 +563,32 @@ def test_real_sound_output_advances(store, qapp):
     advanced = player.position()[1] - ms
     player.pause()
     assert 900 <= advanced <= 1650
+
+
+def test_stopping_the_sound_card_output_silences_its_buffer_at_once():
+    """A pause or a jump must go quiet immediately: the queued audio is muted and dropped
+    before the sink stops (on macOS stop() alone plays it out, ~0.5 s of lag or overlap)."""
+    from livrosound.ui.player import BUFFER_MS, QtSinkOutput
+
+    calls = []
+
+    class Sink:
+        def setVolume(self, v):
+            calls.append(("volume", v))
+
+        def reset(self):
+            calls.append("reset")
+
+        def stop(self):
+            calls.append("stop")
+
+        def deleteLater(self):
+            calls.append("deleted")
+
+    output = QtSinkOutput.__new__(QtSinkOutput)
+    output._sink = Sink()
+    output.stop()
+    assert calls == [("volume", 0.0), "reset", "stop", "deleted"]
+    assert output._sink is None
+    output.stop()  # a second stop is harmless
+    assert BUFFER_MS <= 300, "a pause can never lag more than the buffer"
