@@ -45,6 +45,13 @@ The highlight follows the user's rules for the original layout:
   reads as a stack of lines, like a highlighter pen, rather than one slab.
 
 Clicks and hover use a per-page index of word boxes built once in set_book.
+
+Page views: "scroll" is the continuous column above. "single" and "double"
+show one page (or two side by side) fitted whole into the window, each spread
+exactly one viewport high, so a page turn moves the (hidden) scroll bar by
+the viewport's height and the rendering, highlighting and hit testing above
+work unchanged. The user's margins (ReadingStyle) replace GUTTER beside the
+pages.
 """
 
 from __future__ import annotations
@@ -64,7 +71,14 @@ from PySide6.QtWidgets import QAbstractScrollArea, QApplication, QFrame
 
 from livrosound.book import Book, PageInfo, Word
 from livrosound.ui import theme as themes
-from livrosound.ui.reader_view import ReaderView, centered_scroll_value, outside_band, too_tall
+from livrosound.ui.reader_view import (
+    PAGE_MODES,
+    ReaderView,
+    ReadingStyle,
+    centered_scroll_value,
+    outside_band,
+    too_tall,
+)
 from livrosound.ui.theme import Theme
 
 MIN_ZOOM = 0.8
@@ -431,6 +445,10 @@ class PageView(ReaderView, QAbstractScrollArea):
         self._block_pages: list[int] = []  # each block's page (-1 = none), for current_block
         self._bands: list[Band] = []
         self._highlighted = -1  # the block the bands belong to
+        self._mark_bands: list[tuple[Band, str]] = []  # the reader's highlights and the Find match
+        self._anchor_word: tuple[int, int, int] | None = None  # a drag's first word (block, start, end)
+        self._selection: tuple[tuple[int, int], tuple[int, int]] | None = None
+        self._selection_bands: list[Band] = []
         self._cache: OrderedDict[int, _Entry] = OrderedDict()  # sharp pages
         self._previews: OrderedDict[int, _Entry] = OrderedDict()  # small ones, stretched until a sharp one arrives
         self._failed: set[tuple[int, _Key]] = set()
@@ -441,6 +459,7 @@ class PageView(ReaderView, QAbstractScrollArea):
         self._render_timer.setSingleShot(True)
         self._render_timer.setInterval(RENDER_DELAY_MS)
         self._render_timer.timeout.connect(self._sharpen)
+        self._margins = (GUTTER, GUTTER)  # px beside the pages (the user's, or GUTTER)
         global _quit_hooked
         app = QApplication.instance()
         if app is not None and not _quit_hooked:
@@ -457,6 +476,7 @@ class PageView(ReaderView, QAbstractScrollArea):
         self._serial += 1
         self._book = book
         self._bands, self._highlighted = [], -1
+        self._mark_bands, self._selection, self._selection_bands, self._anchor_word = [], None, [], None
         self._cache.clear()
         self._previews.clear()
         self._failed.clear()
@@ -502,6 +522,53 @@ class PageView(ReaderView, QAbstractScrollArea):
     def zoom(self) -> float:
         return self._zoom
 
+    def set_page_mode(self, mode: str) -> None:
+        if mode not in PAGE_MODES:
+            raise ValueError(f"unknown page mode {mode!r}")
+        if mode == self._page_mode:
+            return
+        anchor = self._anchor()
+        self._page_mode = mode
+        paged = mode != "scroll"
+        self.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff if paged else Qt.ScrollBarPolicy.ScrollBarAlwaysOn
+        )
+        self.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff if paged else Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        if self._book is not None:
+            self._relayout(keep_anchor=False)
+            if anchor is not None:
+                self._restore_anchor(anchor)
+
+    def set_style(self, style: ReadingStyle) -> None:
+        """Only the margins apply to a PDF's own pages."""
+        margins = (
+            style.margin_left if style.margin_left >= 0 else GUTTER,
+            style.margin_right if style.margin_right >= 0 else GUTTER,
+        )
+        if margins != self._margins:
+            self._margins = margins
+            if self._book is not None:
+                self._relayout(keep_anchor=True)
+
+    def spread_step(self) -> int:
+        return max(1, self.viewport().height())
+
+    def page_info(self) -> tuple[int, int, int] | None:
+        """The printed pages on screen (in the middle of the view, scrolling)."""
+        if not self._rects:
+            return None
+        pages = list(self._visible_pages())
+        if not self.paged():
+            middle = self.verticalScrollBar().value() + self.viewport().height() / 2
+            page = min(pages, key=lambda i: abs(self._rects[i].center().y() - middle))
+            pages = [page]
+        return pages[0] + 1, pages[-1] + 1, len(self._rects)
+
+    def _per_spread(self) -> int:
+        return 2 if self._page_mode == "double" else 1
+
     def show_highlight(self, block: int, start: int, end: int) -> None:
         had = bool(self._bands)
         self._bands, self._highlighted = [], block
@@ -518,6 +585,78 @@ class PageView(ReaderView, QAbstractScrollArea):
             self._bands = []
             self.viewport().update()
 
+    def set_marks(self, marks: list[tuple[int, int, int, str]]) -> None:
+        self._mark_bands = []
+        if self._book is not None:
+            for block, start, end, color in marks:
+                if 0 <= block < len(self._book.blocks):
+                    for band in line_bands(self._book.blocks[block].words, start, end):
+                        if 0 <= band.page < len(self._crops):
+                            self._mark_bands.append((band, color))
+        self.viewport().update()
+
+    def selected_range(self) -> tuple[tuple[int, int], tuple[int, int]] | None:
+        return self._selection
+
+    def clear_selection(self) -> None:
+        if self._selection is not None or self._selection_bands:
+            self._selection, self._selection_bands = None, []
+            self.viewport().update()
+
+    def _word_at(self, pos: QPoint) -> tuple[int, int, int] | None:
+        """(block, start char, end char) of the word under a viewport point."""
+        hit = self.hit_test(pos)
+        if hit is None:
+            return None
+        block, char = hit
+        word = next((w for w in self._book.blocks[block].words if w[5] == char), None)
+        return block, char, word[6] if word is not None else char + 1
+
+    def _select_to(self, word: tuple[int, int, int]) -> None:
+        """Select whole words from the drag's first word to this one, in reading order."""
+        a, b = self._anchor_word, word
+        if (b[0], b[1]) < (a[0], a[1]):
+            a, b = b, a
+        self._selection = ((a[0], a[1]), (b[0], b[2]))
+        bands = []
+        for block in range(a[0], min(b[0], a[0] + 400) + 1):
+            words = self._book.blocks[block].words
+            start = a[1] if block == a[0] else 0
+            end = b[2] if block == b[0] else len(self._book.blocks[block].text)
+            bands += [x for x in line_bands(words, start, end) if 0 <= x.page < len(self._crops)]
+        self._selection_bands = bands
+        self.viewport().update()
+
+    def mousePressEvent(self, event) -> None:
+        super().mousePressEvent(event)
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clear_selection()
+            self._anchor_word = self._word_at(event.position().toPoint())
+
+    def mouseMoveEvent(self, event) -> None:
+        super().mouseMoveEvent(event)
+        if event.buttons() & Qt.MouseButton.LeftButton and self._anchor_word is not None:
+            word = self._word_at(event.position().toPoint())
+            if word is not None and (word != self._anchor_word or self._selection is not None):
+                self._select_to(word)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        super().mouseDoubleClickEvent(event)
+        word = self._word_at(event.position().toPoint())
+        if word is not None:
+            self._anchor_word = word
+            self._select_to(word)
+
+    def mouseReleaseEvent(self, event) -> None:
+        super().mouseReleaseEvent(event)
+        if event.button() == Qt.MouseButton.LeftButton and self._selection is not None:
+            self.selection_made.emit(event.globalPosition().toPoint())
+
+    def contextMenuEvent(self, event) -> None:
+        hit = self.hit_test(event.pos())
+        if hit is not None:
+            self.context_requested.emit(*hit, event.globalPos())
+
     def highlight_rects(self) -> list[tuple[int, QRectF]]:
         """The bands as drawn: (page, rect in PDF points)."""
         return [(b.page, QRectF(QPointF(b.box[0], b.box[1]), QPointF(b.box[2], b.box[3]))) for b in self._bands]
@@ -529,6 +668,9 @@ class PageView(ReaderView, QAbstractScrollArea):
         if target is None:
             return
         page, box = target
+        if self.paged():
+            self.turn_to(page // self._per_spread() * self.spread_step())
+            return
         if box is None:  # a block without words (an image): its page's top
             self.scroll_to_value(self._rects[page].top() - EDGE, animate=animate)
             return
@@ -550,6 +692,10 @@ class PageView(ReaderView, QAbstractScrollArea):
         bands = [b for b in line_bands(self._book.blocks[block].words, start, end) if 0 <= b.page < len(self._rects)]
         span = self._span([(b.page, b.box) for b in bands])
         if span is None:
+            return
+        if self.paged():
+            if bands[0].page not in self._visible_pages():
+                self.turn_to(bands[0].page // self._per_spread() * self.spread_step())
             return
         bar = self.verticalScrollBar()
         shift = bar.value() - self.scroll_target()  # judge where the view is heading, not where it is mid-animation
@@ -689,17 +835,22 @@ class PageView(ReaderView, QAbstractScrollArea):
         anchor = self._anchor() if keep_anchor else None
         self.stop_scrolling()
         width = max(1, self.viewport().width())
+        left, right = self._margins
         typical = max((c[2] - c[0]) * f for c, f in zip(self._crops, self._fits)) if self._crops else 1.0
-        self._scale = max(0.02, (width - 2 * GUTTER) / typical) * self._zoom
-        sizes = [self._job_size(i, self._scale) for i in range(len(self._crops))]
-        content_w = max([width] + [w + 2 * GUTTER for w, _ in sizes])
-        rects, tops, y = [], [], EDGE
-        for w, h in sizes:
-            rects.append(QRect((content_w - w) // 2, y, w, h))
-            tops.append(y)
-            y += h + PAGE_GAP
-        self._rects, self._tops = rects, tops
-        self._content = (content_w, y - PAGE_GAP + EDGE if rects else 0)
+        room = max(40, width - left - right)
+        if self.paged():
+            self._layout_spreads(typical, width, room)
+        else:
+            self._scale = max(0.02, room / typical) * self._zoom
+            sizes = [self._job_size(i, self._scale) for i in range(len(self._crops))]
+            content_w = max([width] + [w + left + right for w, _ in sizes])
+            rects, tops, y = [], [], EDGE
+            for w, h in sizes:
+                rects.append(QRect(left + (content_w - left - right - w) // 2, y, w, h))
+                tops.append(y)
+                y += h + PAGE_GAP
+            self._rects, self._tops = rects, tops
+            self._content = (content_w, y - PAGE_GAP + EDGE if rects else 0)
         self._update_scrollbars()
         if anchor is not None:
             self._restore_anchor(anchor)
@@ -708,11 +859,36 @@ class PageView(ReaderView, QAbstractScrollArea):
         self._schedule()
         self.viewport().update()
 
+    def _layout_spreads(self, typical_width: float, width: int, room: int) -> None:
+        """Paged: each spread of one or two pages fitted whole into the view, one viewport high."""
+        per = self._per_spread()
+        height = max(1, self.viewport().height())
+        heights = sorted((c[3] - c[1]) * f for c, f in zip(self._crops, self._fits)) if self._crops else [1.0]
+        typical_height = heights[len(heights) // 2]
+        across = (room - PAGE_GAP * (per - 1)) / per / typical_width
+        down = (height - 2 * EDGE) / typical_height
+        self._scale = max(0.02, min(across * self._zoom, down))
+        sizes = [self._job_size(i, self._scale) for i in range(len(self._crops))]
+        rects, tops = [], []
+        left = self._margins[0]
+        for first in range(0, len(sizes), per):
+            group = sizes[first : first + per]
+            top = first // per * height
+            used = sum(w for w, _ in group) + PAGE_GAP * (len(group) - 1)
+            x = left + (room - used) // 2
+            for w, h in group:
+                rects.append(QRect(x, top + max(EDGE, (height - h) // 2), w, h))
+                tops.append(top)
+                x += w + PAGE_GAP
+        self._rects, self._tops = rects, tops
+        spreads = -(-len(sizes) // per)
+        self._content = (width, spreads * height)
+
     def _update_scrollbars(self) -> None:
         vw, vh = self.viewport().width(), self.viewport().height()
         v, h = self.verticalScrollBar(), self.horizontalScrollBar()
         v.setRange(0, max(0, self._content[1] - vh))
-        v.setPageStep(max(1, vh - 40))
+        v.setPageStep(max(1, vh if self.paged() else vh - 40))
         v.setSingleStep(40)
         h.setRange(0, max(0, self._content[0] - vw))
         h.setPageStep(max(1, vw))
@@ -731,7 +907,11 @@ class PageView(ReaderView, QAbstractScrollArea):
 
     def _restore_anchor(self, anchor: tuple[int, float, float]) -> None:
         page, fx, fy = anchor
-        rect = self._rects[min(page, len(self._rects) - 1)]
+        page = min(page, len(self._rects) - 1)
+        if self.paged():
+            self.verticalScrollBar().setValue(page // self._per_spread() * self.spread_step())
+            return
+        rect = self._rects[page]
         self.horizontalScrollBar().setValue(int(rect.left() + fx * rect.width() - self.viewport().width() / 2))
         self.verticalScrollBar().setValue(int(rect.top() + fy * rect.height() - self.viewport().height() / 2))
 
@@ -740,6 +920,10 @@ class PageView(ReaderView, QAbstractScrollArea):
         if not self._rects:
             return range(0)
         v = self.verticalScrollBar().value() if value is None else value
+        if self.paged():
+            per = self._per_spread()
+            first = min(len(self._rects) - 1, v // self.spread_step() * per)
+            return range(first, min(len(self._rects), first + per))
         first = max(0, bisect.bisect_right(self._tops, v) - 1)
         last = max(first, bisect.bisect_right(self._tops, v + self.viewport().height()) - 1)
         if self._rects[first].bottom() < v and first + 1 < len(self._rects):  # in the gap above a page
@@ -856,7 +1040,7 @@ class PageView(ReaderView, QAbstractScrollArea):
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         bar = self.verticalScrollBar()
-        if event.key() in (Qt.Key.Key_Home, Qt.Key.Key_End) and not event.modifiers():
+        if event.key() in (Qt.Key.Key_Home, Qt.Key.Key_End) and not event.modifiers() and not self.paged():
             self._scrolled_by_hand()
             bar.setValue(bar.minimum() if event.key() == Qt.Key.Key_Home else bar.maximum())
             return
@@ -868,6 +1052,7 @@ class PageView(ReaderView, QAbstractScrollArea):
         h, v = self.horizontalScrollBar().value(), self.verticalScrollBar().value()
         key, dpr = self._key(), self.viewport().devicePixelRatioF()
         highlighted = {band.page for band in self._bands}
+        marked = {band.page for band, _ in self._mark_bands} | {band.page for band in self._selection_bands}
         for page in self._visible_pages():
             rect = QRectF(self._rects[page]).translated(-h, -v)
             self._paint_frame(painter, rect)
@@ -884,6 +1069,8 @@ class PageView(ReaderView, QAbstractScrollArea):
                 painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
                 painter.drawImage(rect, shown.image, QRectF(shown.image.rect()))
                 painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+            if page in marked:
+                self._paint_marks(painter, page, rect, shown)
             if page in highlighted:
                 self._paint_bands(painter, page, rect, shown)
         painter.end()
@@ -907,6 +1094,29 @@ class PageView(ReaderView, QAbstractScrollArea):
                 painter.setBrush(QColor(0, 0, 0, alpha))
                 painter.drawRoundedRect(rect.adjusted(-spread, -spread + 1, spread, spread + 1), spread, spread)
         painter.setBrush(Qt.BrushStyle.NoBrush)
+
+    def _paint_marks(self, painter: QPainter, page: int, rect: QRectF, shown: _Entry | None) -> None:
+        """The reader's highlights (multiplied on, like a highlighter pen) and the selection."""
+        painter.save()
+        painter.setClipRect(rect)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        light = shown is None or not shown.toned or not self._theme.dark
+        painter.setCompositionMode(
+            QPainter.CompositionMode.CompositionMode_Multiply if light else QPainter.CompositionMode.CompositionMode_Screen
+        )
+        for band, color in self._mark_bands:
+            if band.page == page:
+                fill = QColor(color)
+                if not light:
+                    fill = fill.darker(220)
+                painter.fillRect(self.map_box(page, band.box), fill)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+        selection = QColor(themes.selection_color(self._theme))
+        selection.setAlphaF(0.55)
+        for band in self._selection_bands:
+            if band.page == page:
+                painter.fillRect(self.map_box(page, band.box), selection)
+        painter.restore()
 
     def _paint_bands(self, painter: QPainter, page: int, rect: QRectF, shown: _Entry | None) -> None:
         path = QPainterPath()

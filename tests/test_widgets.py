@@ -421,22 +421,21 @@ def test_alert_hides_an_empty_text(host):
 
 def test_landing_buttons(host):
     landing = LivroSoundLanding(host)
-    uploads, resumes = [], []
+    uploads, libraries = [], []
     landing.upload_clicked.connect(lambda: uploads.append(True))
-    landing.resume_clicked.connect(lambda: resumes.append(True))
-    assert not landing.resume_button.isEnabled()  # an empty library
+    landing.library_clicked.connect(lambda: libraries.append(True))
+    assert landing.library_button.isEnabled()  # the library page says when it's empty
     landing.upload_button.click()
     assert uploads == [True]
-    landing.set_resume_enabled(True)
-    landing.resume_button.click()
-    assert resumes == [True]
+    landing.library_button.click()
+    assert libraries == [True]
     assert landing.upload_button.text() == "Upload New Book"
-    assert landing.resume_button.text() == "Resume a Previous Book"
-    assert landing.upload_button.width() == landing.resume_button.width()
+    assert landing.library_button.text() == "Go to Library"
+    assert landing.upload_button.width() == landing.library_button.width()
 
 
 def test_landing_follows_the_theme(host):
-    landing = LivroSoundLanding(host, resume_enabled=True)
+    landing = LivroSoundLanding(host)
     landing.resize(1100, 780)
     landing.show()
     for key in ("original", "dark"):

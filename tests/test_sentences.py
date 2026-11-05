@@ -113,3 +113,15 @@ def test_spans_are_trimmed_and_ordered():
     spans = split_sentences(text)
     assert [text[a:b] for a, b in spans] == ["One.", "Two!", "Three?"]
     assert all(b1 <= a2 for (_, b1), (a2, _) in zip(spans, spans[1:]))
+
+
+def test_word_at_walks_the_words_by_their_syllables():
+    from livrosound.sentences import word_at
+
+    text = "Hello there, wonderful world."
+    assert word_at(text, 0, len(text), 0.0) == (0, 5)
+    assert word_at(text, 0, len(text), 0.999) == (23, 29)
+    spans = [word_at(text, 0, len(text), f / 20) for f in range(21)]
+    assert spans == sorted(spans) and {text[a:b] for a, b in spans} == {"Hello", "there,", "wonderful", "world."}
+    assert word_at(text, 13, 22, 0.5) == (13, 22)
+    assert word_at("   ", 0, 3, 0.5) == (0, 3)

@@ -731,3 +731,122 @@ def test_real_epub_opens_in_both_layouts(qapp, name):
         if mode == "original":
             assert matched > 0.97
         assert opened < 10.0
+
+
+# ---------- reading style and page views ----------
+
+
+def _long_book() -> Book:
+    rng = random.Random(11)
+    return Book("long", "Long", "", "", "txt", blocks=[Block("heading", "One", level=1), *_paragraphs(rng, 120)])
+
+
+def test_style_sets_type_spacing_and_justification(qapp):
+    from livrosound.ui.reader_view import ReadingStyle
+
+    view = _view(qapp, _sample_book())
+    paragraph = next(i for i, b in enumerate(view._book.blocks) if b.kind == "paragraph")
+    before = view.document().documentLayout().blockBoundingRect(view.document().findBlock(view._starts[paragraph]))
+    view.set_style(ReadingStyle(weight=600, line_spacing=2.0, paragraph_spacing=1.0, justify=True, word_spacing=2.0))
+    qapp.processEvents()
+    block = view.document().findBlock(view._starts[paragraph])
+    assert block.blockFormat().alignment() & Qt.AlignmentFlag.AlignJustify
+    assert view.document().defaultFont().weight() == QFont.Weight(600)
+    assert block.charFormat().fontWordSpacing() == 2.0 or block.begin().fragment().charFormat().fontWordSpacing() == 2.0
+    after = view.document().documentLayout().blockBoundingRect(block)
+    assert after.height() > before.height() * 1.2  # looser lines
+    _check_positions(view)
+    view.close()
+
+
+def _check_positions(view: ReflowView) -> None:
+    for i, block in enumerate(view._book.blocks):
+        if block.kind not in ("image", "separator") and block.text:
+            assert _char_at(view, view._doc_pos(i, 0)) == _displayed(block.text[0])
+
+
+def test_margins_and_column_width(qapp):
+    from livrosound.ui.reader_view import ReadingStyle
+
+    view = _view(qapp, _sample_book(), size=(1200, 700))
+    view.set_style(ReadingStyle(max_column=500))
+    assert view._column == 500
+    margins = view.viewportMargins()
+    assert abs(margins.left() - margins.right()) <= view.verticalScrollBar().sizeHint().width() + 1  # centered
+    view.set_style(ReadingStyle(margin_left=40, margin_right=400, max_column=2000))
+    margins = view.viewportMargins()
+    assert margins.left() == 40 and margins.right() >= 400
+    assert view._column == 1200 - view.verticalScrollBar().sizeHint().width() - 440
+    view.close()
+
+
+def test_single_page_turns_whole_pages_and_follows_the_reading(qapp):
+    view = _view(qapp, _long_book(), size=(800, 600))
+    view.set_page_mode("single")
+    qapp.processEvents()
+    assert view.verticalScrollBar().isHidden() or view.verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+    height = view.viewport().height()
+    assert view.document().pageSize().height() == height and view.spread_step() == height
+    assert view.verticalScrollBar().value() == 0
+    view.page_step(1)
+    assert view.verticalScrollBar().value() == height
+    QTest.keyClick(view, Qt.Key.Key_PageDown)
+    assert view.verticalScrollBar().value() == 2 * height
+    QTest.keyClick(view, Qt.Key.Key_Up)
+    assert view.verticalScrollBar().value() == height
+    assert view.page_info() is None  # not counted yet
+    total = view.count_pages()
+    assert total > 5 and view.page_info() == (2, 2, total)
+    # Auto-follow turns to the page with the sentence rather than scrolling.
+    last = len(view._book.blocks) - 1
+    view.show_highlight(last, 0, 10)
+    view.keep_in_view(last, 0, 10)
+    assert view.verticalScrollBar().value() % height == 0
+    assert view._page_of(view._doc_pos(last, 0)) in view._pages_shown()
+    QTest.keyClick(view, Qt.Key.Key_End)
+    QTest.keyClick(view, Qt.Key.Key_Home)
+    assert view.verticalScrollBar().value() == 0
+    # No line is cut by a page edge.
+    layout, doc = view.document().documentLayout(), view.document()
+    block = doc.begin()
+    while block.isValid():
+        rect = layout.blockBoundingRect(block)
+        lines = block.layout()
+        for i in range(lines.lineCount()):
+            top = rect.top() + lines.lineAt(i).y()
+            assert int(top // height) == int((top + lines.lineAt(i).height() - 0.01) // height)
+        block = block.next()
+    view.close()
+
+
+def test_double_page_paints_two_pages_and_clicks_the_right_one(qapp):
+    view = _view(qapp, _long_book(), size=(1200, 700))
+    view.set_page_mode("double")
+    qapp.processEvents()
+    height = view.viewport().height()
+    assert view.spread_step() == 2 * height
+    assert view.viewport().width() == 2 * view._column + 64
+    view.page_step(1)
+    assert view.verticalScrollBar().value() == 2 * height
+    first, last, total = view.page_info() if view.count_pages() else (0, 0, 0)
+    assert (first, last) == (3, 4)
+    # A click on the right page lands on the text of page 4.
+    clicks = []
+    view.clicked.connect(lambda block, char: clicks.append((block, char)))
+    point = QPoint(view._column + 64 + view._column // 2, 120)
+    QTest.mouseClick(view.viewport(), Qt.MouseButton.LeftButton, pos=point)
+    assert clicks and view._page_of(view._doc_pos(*clicks[0])) == 3
+    left = QPoint(view._column // 2, 120)
+    QTest.mouseClick(view.viewport(), Qt.MouseButton.LeftButton, pos=left)
+    assert view._page_of(view._doc_pos(*clicks[1])) == 2
+    # Both pages are painted.
+    image = view.viewport().grab().toImage()
+    page = QColor(themes.current().page)
+
+    def inked(x0: int, x1: int) -> bool:
+        return any(image.pixelColor(x, y) != page for x in range(x0, x1, 3) for y in range(60, height - 120, 7))
+
+    assert inked(0, view._column) and inked(view._column + 64, 2 * view._column + 64)
+    view.set_page_mode("scroll")
+    assert view.document().pageSize().height() < 0 and view.viewportMargins().left() > 0
+    view.close()

@@ -13,8 +13,8 @@ from pathlib import Path
 
 import pymupdf
 import pytest
-from PySide6.QtCore import QPoint, QPointF, Qt
-from PySide6.QtGui import QColor, QWheelEvent
+from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
+from PySide6.QtGui import QColor, QMouseEvent, QWheelEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
@@ -772,3 +772,72 @@ def test_digital_pdfs_screenshots(qapp, name):
         v.shutdown()
         v.close()
     themes.set_current(THEMES["original"])
+
+
+# ---------- single and double page ----------
+
+
+def test_single_and_double_page_show_whole_pages_and_turn_them(view, pdf_book, qapp):
+    pages = len(pdf_book.pages)
+    assert view.page_info()[2] == pages
+    view.set_page_mode("single")
+    qapp.processEvents()
+    height = view.viewport().height()
+    assert view.spread_step() == height and list(view._visible_pages()) == [0]
+    rect = view.page_rect(0)
+    assert rect.top() >= 0 and rect.bottom() <= height and rect.right() <= view.viewport().width()  # whole page
+    view.page_step(1)
+    assert view.verticalScrollBar().value() == height and view.page_info() == (2, 2, pages)
+    view.set_page_mode("double")
+    qapp.processEvents()
+    assert list(view._visible_pages()) == [0, 1] or list(view._visible_pages()) == [2, 3]
+    view.turn_to(0)
+    left, right = view.page_rect(0), view.page_rect(1)
+    assert left.right() < right.left() and abs(left.top() - right.top()) < height / 4
+    assert view.page_info() == (1, 2, pages)
+    # A word on the right page is clicked like any other.
+    block = next(i for i, b in enumerate(pdf_book.blocks) if b.words and b.words[0][0] == 1)
+    word = pdf_book.blocks[block].words[0]
+    point = view.map_box(1, word[1:5]).center().toPoint()
+    assert view.hit_test(point)[0] == block
+    # Auto-follow turns to the spread holding the sentence.
+    far = max(i for i, b in enumerate(pdf_book.blocks) if b.words)
+    view.show_highlight(far, 0, 5)
+    view.keep_in_view(far, 0, 5)
+    assert pdf_book.blocks[far].words[0][0] in view._visible_pages()
+    view.set_page_mode("scroll")
+    assert view.verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOn
+
+
+def test_margins_move_the_pages(view, qapp):
+    from livrosound.ui.reader_view import ReadingStyle
+
+    before = view.page_rect(0)
+    view.set_style(ReadingStyle(margin_left=200, margin_right=24))
+    qapp.processEvents()
+    after = view.page_rect(0)
+    assert after.left() >= 200 and after.width() < before.width()
+
+
+def test_dragging_selects_whole_words_and_marks_are_drawn(view, pdf_book, qapp):
+    block = next(i for i, b in enumerate(pdf_book.blocks) if len(b.words) > 6 and b.words[0][0] == 0)
+    words = pdf_book.blocks[block].words
+    start = view.map_box(0, words[1][1:5]).center().toPoint()
+    end = view.map_box(0, words[4][1:5]).center().toPoint()
+    made = []
+    view.selection_made.connect(made.append)
+    QTest.mousePress(view.viewport(), Qt.MouseButton.LeftButton, pos=start)
+    QTest.mouseMove(view.viewport(), end)
+    move = QMouseEvent(QEvent.Type.MouseMove, QPointF(end), QPointF(view.viewport().mapToGlobal(end)),
+                       Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+    QApplication.sendEvent(view.viewport(), move)
+    QTest.mouseRelease(view.viewport(), Qt.MouseButton.LeftButton, pos=end)
+    assert view.selected_range() == ((block, words[1][5]), (block, words[4][6])) and made
+    assert view._selection_bands
+    view.clear_selection()
+    assert view.selected_range() is None
+    before = view.viewport().grab().toImage()
+    view.set_marks([(block, words[0][5], words[2][6], "#FFD84D")])
+    qapp.processEvents()
+    after = view.viewport().grab().toImage()
+    assert before != after and view._mark_bands

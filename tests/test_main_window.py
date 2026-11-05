@@ -19,11 +19,11 @@ import zipfile
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import QCoreApplication, QEventLoop, Qt, QTimer
+from PySide6.QtCore import QCoreApplication, QEventLoop, QMimeData, Qt, QTimer, QUrl
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QDialog
 
-from livrosound import dsp, paths
+from livrosound import bookinfo, dsp, paths
 from livrosound import export as export_mod
 from livrosound.audio_store import cue_at
 from livrosound.book import Book
@@ -118,7 +118,6 @@ class Script:
         self.layout: str | None = "livrosound"
         self.voice: str | None = "Aaron"
         self.customize = "generate"
-        self.library_pick: str | None = None
         self.file = ""
         self.save_as = ""
         self.windows: list[tuple[MainWindow, HeldEngine]] = []
@@ -127,7 +126,6 @@ class Script:
         monkeypatch.setattr(dialogs.LayoutDialog, "ask", lambda *a, **k: self.layout)
         monkeypatch.setattr(dialogs.ChooseVoiceDialog, "ask", lambda *a, **k: self.voice)
         monkeypatch.setattr(dialogs.CustomizeAudioDialog, "ask", lambda *a, **k: self.customize)
-        monkeypatch.setattr(dialogs.LibraryDialog, "ask", lambda *a, **k: self.library_pick)
         monkeypatch.setattr(mw.QFileDialog, "getOpenFileName", lambda *a, **k: (self.file, ""))
         monkeypatch.setattr(mw.QFileDialog, "getSaveFileName", lambda *a, **k: (self.save_as, ""))
 
@@ -184,6 +182,13 @@ def expected_highlight(window: MainWindow) -> tuple[int, int, int]:
     cues = window.store.info(block).cues
     cue = cue_at(cues, ms) or cues[0]
     return block, cue.start_char, cue.end_char
+
+
+def pick_from_library(window: MainWindow, book_id: str) -> None:
+    """Go to Library, then click the book's cover."""
+    window.landing.library_button.click()
+    assert window.pages.currentWidget() is window.library_page
+    window.library_page.open_requested.emit(book_id)
 
 
 def open_book(script: Script, window: MainWindow, path: Path) -> None:
@@ -398,13 +403,11 @@ def test_quit_and_resume_where_you_left_off(script, tmp_path):
     assert record.engine == "Fake" and record.voice == "Aaron" and record.speech_options
     assert 0 < record.read_fraction < 1
 
-    # A new session: Resume a Previous Book → the same position, highlighted; no ding.
+    # A new session: Go to Library → the book → the same position, highlighted; no ding.
     second, outputs2, engine2 = script.window()
-    assert second.landing.resume_button.isEnabled()
-    script.library_pick = book_id
     script.answers["Continue generating audio?"] = True
     engine2.hold()
-    second.landing.resume_button.click()
+    pick_from_library(second, book_id)
     wait_until(lambda: second.book is not None and second._task is None, what="the book to reopen")
     assert second.player.position() == saved
     assert second._highlight == expected_highlight(second) and second.view._highlight == second._highlight
@@ -436,9 +439,8 @@ def test_resume_without_continuing_offers_resume_generating(script, tmp_path):
     wait_until(lambda: not _threads_running(window))
 
     second, _, engine2 = script.window()
-    script.library_pick = book_id
     script.answers["Continue generating audio?"] = False
-    second.open_previous()
+    pick_from_library(second, book_id)
     wait_until(lambda: second.book is not None and second._task is None)
     assert second._worker is None
     assert second.resume_button.isVisible() and not second.export_button.isVisible()
@@ -655,17 +657,15 @@ def test_removing_the_open_book_from_the_library_closes_it(script, tmp_path, mon
     script.voice = None
     open_book(script, window, write_txt(tmp_path))
     book_id = window.book.book_id
+    title = window.book.title
 
-    def remove_it(*args, **kwargs):
-        window.library.remove(book_id)
-        window.library.save()
-        return None
-
-    monkeypatch.setattr(dialogs.LibraryDialog, "ask", remove_it)
-    window.resume_action.trigger()
-    assert window.book is None and window.pages.currentWidget() is window.landing
+    window.library_action.trigger()
+    assert window.pages.currentWidget() is window.library_page and window.library_page.book_button.isVisible()
+    script.answers[f"Remove “{title}” from your library?"] = True
+    window.library_page.remove_requested.emit([book_id])
+    assert window.book is None and window.pages.currentWidget() is window.library_page
     assert Library.load().get(book_id) is None and not paths.book_dir(book_id).exists()
-    assert not window.landing.resume_button.isEnabled()
+    assert window.library_page.empty.isVisible() and not window.library_page.book_button.isVisible()
 
 
 # ---------- Choose a Layout gets real previews ----------
@@ -861,14 +861,11 @@ def test_removing_the_open_book_closes_it_and_never_brings_it_back(script, tmp_p
     window.toggle_play()
     play(window, outputs, 1500)
 
-    def remove_in_dialog(parent, library, on_remove):
-        on_remove(book_id)  # what LibraryDialog does after its "Remove?" question
-        wait(3500)  # the user keeps looking at the list: the 3 s position save fires
-        return None
-
-    monkeypatch.setattr(dialogs.LibraryDialog, "ask", remove_in_dialog)
-    window.resume_action.trigger()
-    assert window.book is None and window.pages.currentWidget() is window.landing
+    window.library_action.trigger()
+    script.answers[f"Remove “{window.book.title}” from your library?"] = True
+    window.library_page.remove_requested.emit([book_id])
+    wait(3500)  # the user keeps looking at the library: the 3 s position save would fire
+    assert window.book is None and window.pages.currentWidget() is window.library_page
     assert window.library.get(book_id) is None and Library.load().get(book_id) is None
     assert not paths.book_dir(book_id).exists()
 
@@ -881,8 +878,8 @@ def test_removing_the_open_book_while_it_generates(script, tmp_path, monkeypatch
     open_book(script, window, write_txt(tmp_path))
     engine.park()
     book_id = window.book.book_id
-    monkeypatch.setattr(dialogs.LibraryDialog, "ask", lambda parent, library, on_remove: on_remove(book_id))
-    window.open_previous()
+    script.answers[f"Remove “{window.book.title}” from your library?"] = True
+    window.library_page.remove_requested.emit([book_id])
     assert window.book is None and window._retiring
     assert paths.book_dir(book_id).exists()  # its worker still holds the audio
     engine.release()
@@ -900,14 +897,10 @@ def test_removing_the_open_book_outside_the_window_is_not_undone(script, tmp_pat
     open_book(script, window, write_txt(tmp_path))
     book_id = window.book.book_id
 
-    def remove_it(*args, **kwargs):
-        window.library.remove(book_id)
-        window.library.save()
-        wait(1500)  # blocks keep arriving meanwhile
-        return None
-
-    monkeypatch.setattr(dialogs.LibraryDialog, "ask", remove_it)
-    window.resume_action.trigger()
+    window.library.remove(book_id)
+    window.library.save()
+    wait(1500)  # blocks keep arriving meanwhile
+    window.library_action.trigger()  # the library sees the book is gone and closes it
     assert window.book is None and Library.load().get(book_id) is None
 
 
@@ -988,12 +981,12 @@ def test_a_book_switched_under_choose_a_voice_keeps_its_own_voice(script, tmp_pa
     wait_until(lambda: len(window.store.generated()) > 5)
     engine.park()
     a_made = window.store.generated()
-    script.library_pick = b_id
-    window.open_previous()
+    window.show_library()
+    window.library_page.open_requested.emit(b_id)
     wait_until(lambda: window.book is not None and window.book.book_id == b_id and window._task is None)
-    script.library_pick = a_id
     script.answers["Continue generating audio?"] = False
-    window.open_previous()  # waits for A's worker to stop
+    window.show_library()
+    window.library_page.open_requested.emit(a_id)  # waits for A's worker to stop
 
     def choose_while_a_reopens(*args, **kwargs):
         engine.release()
@@ -1028,12 +1021,13 @@ def test_export_survives_another_book_opening(script, tmp_path, monkeypatch):
     open_book(script, window, _book_c(tmp_path))
     c_id = window.book.book_id
     engine.park()
-    script.library_pick = a_id
-    window.open_previous()
+    window.show_library()
+    window.library_page.open_requested.emit(a_id)
     wait_until(lambda: window.book.book_id == a_id and window._task is None)
-    script.library_pick = c_id
     script.answers["Continue generating audio?"] = False
-    window.open_previous()  # waits for C's worker
+    window.show_library()
+    window.library_page.open_requested.emit(c_id)  # waits for C's worker
+    window.library_page.back_to_book_requested.emit()  # and meanwhile A is exported
     assert window._pending_open == c_id and window.export_button.isVisible()
     real = export_mod.export_mp3
 
@@ -1114,8 +1108,8 @@ def test_a_missing_pdf_opens_in_the_livrosound_layout_and_says_why(script, tmp_p
     wait_until(lambda: _closed_for_good(window))
     pdf.unlink()
     second, _, _ = script.window()
-    script.library_pick = book_id
-    second.open_previous()
+    second.show_library()
+    second.library_page.open_requested.emit(book_id)
     wait_until(lambda: second.book is not None and second._task is None)
     wait_until(lambda: script.informed, what="the explanation")
     assert script.informed[-1][0] == "The PDF isn't where it was."
@@ -1152,13 +1146,14 @@ def test_asking_twice_for_a_book_that_waits_opens_it_once(script, tmp_path, monk
     engine.release()
     wait_until(lambda: len(window.store.generated()) > 3)
     engine.park()
-    script.library_pick = b_id
-    window.open_previous()
+    window.show_library()
+    window.library_page.open_requested.emit(b_id)
     wait_until(lambda: window.book.book_id == b_id and window._task is None)
-    script.library_pick = a_id
     script.answers["Continue generating audio?"] = False
-    window.open_previous()
-    window.open_previous()  # refused: still opening
+    window.show_library()
+    window.library_page.open_requested.emit(a_id)
+    window.show_library()
+    window.library_page.open_requested.emit(a_id)  # refused: still opening
     script.file = str(a)
     window.open_book_dialog()  # refused too
     assert len(window._released) == 1 and window.statusBar().currentMessage() == "Still opening a book…"
@@ -1278,3 +1273,361 @@ def test_a_heading_lights_up_when_it_is_heard(script, tmp_path):
     play(window, outputs, lead_in)
     assert window._highlight[0] == heading
     window.toggle_play()
+
+
+# ---------- the library page ----------
+
+
+def test_the_library_keeps_the_open_book_and_reads_missing_book_info(script, tmp_path):
+    window, _, _ = script.window()
+    script.voice = None
+    open_book(script, window, write_txt(tmp_path))
+    book_id, title = window.book.book_id, window.book.title
+    record = window.library.get(book_id)
+    assert record.date_added and record.spoken_chars > 0 and record.info_version == bookinfo.INFO_VERSION
+    assert record.pages >= 1  # words / 275
+    # An older record without the info: Go to Library reads it in the background.
+    record.info_version, record.pages, record.spoken_chars = 0, 0, 0
+    window.library_toolbar_action.trigger()
+    assert window.pages.currentWidget() is window.library_page and window.book is not None
+    assert window.library_page.book_button.toolTip() == f"Return to “{title}”"
+    wait_until(lambda: window._info_task is None, what="the book info")
+    assert record.info_version == bookinfo.INFO_VERSION and record.pages >= 1 and record.spoken_chars > 0
+    window.library_page.back_to_book_requested.emit()
+    assert window.pages.currentWidget() is window.reader_page
+    window.show_library()
+    window.library_page.open_requested.emit(book_id)  # the open book: straight back to it
+    assert window.pages.currentWidget() is window.reader_page and window.book.book_id == book_id
+
+
+def test_book_details_save_tags_and_collections(script, tmp_path, monkeypatch):
+    window, _, _ = script.window()
+    script.voice = None
+    open_book(script, window, write_txt(tmp_path))
+    book_id = window.book.book_id
+    monkeypatch.setattr(dialogs.BookDetailsDialog, "ask", lambda *a, **k: (["classic"], ["Summer"]))
+    window.show_library()
+    window.library_page.details_requested.emit(book_id)
+    record = Library.load().get(book_id)
+    assert (record.tags, record.collections) == (["classic"], ["Summer"])
+
+
+def test_open_last_book_on_start(script, tmp_path):
+    window, _, _ = script.window()
+    script.voice = None
+    open_book(script, window, write_txt(tmp_path))
+    book_id = window.book.book_id
+    window.settings.open_last_book = True
+    window.settings.save()
+    window.close()
+    wait_until(lambda: not _threads_running(window))
+    second, _, _ = script.window()
+    script.answers["Continue generating audio?"] = False
+    wait_until(lambda: second.book is not None and second._task is None, what="the last book to open")
+    assert second.book.book_id == book_id and second.pages.currentWidget() is second.reader_page
+
+
+def test_books_from_finder_or_dropped_are_imported(script, tmp_path):
+    window, _, _ = script.window()
+    script.voice = None
+    path = write_txt(tmp_path)
+    window.settings.auto_import = False
+    script.answers["Add “rain.txt” to your library?"] = False
+    window.open_external(str(path))
+    assert window.book is None and window._task is None
+    window.settings.auto_import = True
+    mime = QMimeData()
+    mime.setUrls([QUrl.fromLocalFile(str(tmp_path / "notes.xyz")), QUrl.fromLocalFile(str(path))])
+    assert window._dropped_book(mime) == str(path)
+    window.open_external(str(path))
+    wait_until(lambda: window.book is not None and window._task is None, what="the dropped book")
+    assert window.book.source_path == str(path)
+
+
+def test_auto_mode_follows_the_appearance(script, monkeypatch):
+    window, _, _ = script.window()
+    dark = {"on": False}
+    monkeypatch.setattr(mw, "_system_is_dark", lambda: dark["on"])
+    window.settings.auto_mode = True
+    window.settings.light_theme, window.settings.dark_theme = "calm", "quiet"
+    window._follow_appearance()
+    assert window.theme.key == "calm"
+    dark["on"] = True
+    window._follow_appearance()
+    assert window.theme.key == "quiet"
+    window._apply_theme("dark")  # chosen while macOS is dark: the dark theme from now on
+    assert window.settings.dark_theme == "dark" and window.settings.light_theme == "calm"
+    window.settings.auto_mode = False
+    window._follow_appearance()
+    assert window.theme.key == "dark"
+
+
+# ---------- reading settings ----------
+
+
+def test_settings_apply_live_and_the_page_line_shows_progress(script, tmp_path):
+    window, _, _ = script.window()
+    script.voice = None
+    open_book(script, window, write_txt(tmp_path))
+    view = window.view
+    window.settings.always_show_status_bar = True
+    window._change_setting("page_view", "single")
+    assert view.page_mode() == "single"
+    window._count_pages()
+    first, last, total = view.page_info()
+    assert first == 1 and total >= 1
+    assert window.reading_info_text().startswith(f"Page 1 of {total}") and window.reading_info.isVisible()
+    window._change_setting("justify", True)
+    window._change_setting("font_weight", 600)
+    assert view._style.justify and view._style.weight == 600
+    window._change_setting("show_page_numbers", False)
+    assert window.reading_info_text() == "0%"
+    window._change_setting("show_read_percent", False)
+    assert window.reading_info_text() == "" and not window.reading_info.isVisible()
+    window._change_setting("highlight_unit", "paragraph")
+    window._change_setting("theme", "calm")
+    assert window.theme.key == "calm"
+    window._change_setting("custom_page", "#203040")
+    window._change_setting("theme", "custom")
+    assert window.theme.key == "custom" and window.theme.page == "#203040"
+    assert Library.load() is not None and mw.Settings.load().page_view == "single"
+
+
+def test_word_and_paragraph_highlighting_follow_the_audio(script, tmp_path):
+    window, outputs, _ = script.window()
+    script.answers["Generate audio from the beginning?"] = True
+    open_book(script, window, write_txt(tmp_path))
+    wait_until(lambda: window._worker is None)
+    window.settings.highlight_unit = "paragraph"
+    window.toggle_play()
+    play(window, outputs, 200)
+    while cue_at(window.store.info(window.player.position()[0]).cues, window.player.position()[1]) is None:
+        play(window, outputs, 100)  # past the title's breath, into words
+    play(window, outputs, 200)
+    block = window.player.position()[0]
+    assert window._highlight == (block, 0, len(window.book.blocks[block].text))
+    window._change_setting("highlight_unit", "word")
+    play(window, outputs, 100)
+    block, start, end = window._highlight
+    sentence = expected_highlight(window)
+    assert sentence[1] <= start < end <= sentence[2] and " " not in window.book.blocks[block].text[start:end]
+
+
+# ---------- highlights, notes, Look Up, Find, reading without audio ----------
+
+
+def _select(window, start: tuple[int, int], end: tuple[int, int]) -> None:
+    """Select text in the reflow view as a drag would."""
+    view = window.view
+    cursor = view.textCursor()
+    cursor.setPosition(view._doc_pos(*start))
+    cursor.setPosition(view._doc_pos(*end), cursor.MoveMode.KeepAnchor)
+    view.setTextCursor(cursor)
+
+
+def test_selecting_text_offers_highlights_notes_and_look_up(script, tmp_path):
+    window, _, _ = script.window()
+    script.voice = None
+    open_book(script, window, write_txt(tmp_path))
+    block = next(i for i, b in enumerate(window.book.blocks) if b.kind == "paragraph")
+    _select(window, (block, 4), (block, 8))
+    assert window.view.selected_range() == ((block, 4), (block, 8))
+    menu = window.selection_menu()
+    labels = [a.text() for a in menu.actions() if a.text()]
+    word = window.book.blocks[block].text[4:8]
+    assert labels[:6] == ["Highlight", "Yellow", "Green", "Blue", "Pink", "Purple"]
+    assert "Add Note…" in labels and "Copy" in labels and f"Look Up “{word}”" in labels
+    next(a for a in menu.actions() if a.text() == "Blue").trigger()
+    [item] = window.annotations.all()
+    assert (item.start_block, item.start_char, item.end_char, item.color) == (block, 4, 8, "blue")
+    assert window.view.selected_range() is None
+    assert any(m[:3] == (block, 4, 8) for m in window.view._marks)
+    # Right-click on it: change color, add a note, remove it.
+    menu = window.annotation_menu(item.id)
+    window.ask_note = lambda title, current: "A note"
+    next(a for a in menu.actions() if a.text() == "Add Note…").trigger()
+    assert window.annotations.get(item.id).note == "A note"
+    window._open_notes()
+    notes = window._notes_popover
+    assert notes.list.count() == 1
+    notes.list.itemClicked.emit(notes.list.item(0))
+    next(a for a in window.annotation_menu(item.id).actions() if a.text() == "Remove Highlight").trigger()
+    assert window.annotations.all() == []
+    # Add Note… on a selection makes a highlight with its note.
+    _select(window, (block, 0), (block, 3))
+    next(a for a in window.selection_menu().actions() if a.text() == "Add Note…").trigger()
+    assert [a.note for a in window.annotations.all()] == ["A note"]
+    # Look Up shows the Mac's definition with the dictionaries' links.
+    window.define = lambda w: f"{w}: a test definition."
+    window.look_up(" rain, ")
+    popover = window._definition_popover
+    assert popover.definition.text() == "rain: a test definition."
+    assert [b.text() for b in popover.link_buttons] == ["Dictionary", "Merriam-Webster", "Oxford"]
+    menu = window.word_menu(block, 1)
+    assert [a.text() for a in menu.actions()][0].startswith("Look Up “")
+
+
+def test_find_in_book(script, tmp_path):
+    window, _, _ = script.window()
+    script.voice = None
+    open_book(script, window, write_txt(tmp_path))
+    window.find_action.trigger()
+    assert not window.find_bar.isHidden()
+    window.open_find("the")
+    total = len(window._matches)
+    assert total > 3 and window.find_bar.count.text() == f"1 of {total}"
+    first = window._matches[0]
+    assert (first.block, first.start, first.end, mw.FIND_COLOR) in window.view._marks
+    window._step_match(1)
+    assert window._match == 1 and window.find_bar.count.text() == f"2 of {total}"
+    window._step_match(-2)
+    assert window._match == total - 1  # wraps
+    window.open_find("no such words here")
+    assert window.find_bar.count.text() == "Not found"
+    window.find_bar.close_bar()
+    assert window._matches == [] and not any(m[3] == mw.FIND_COLOR for m in window.view._marks)
+
+
+def test_reading_without_audio(script, tmp_path):
+    window, _, _ = script.window()
+    window.settings.read_aloud = False
+    path = write_txt(tmp_path)
+    open_book(script, window, path)  # no voice is asked for, nothing is generated
+    assert script.asked == [] and window._worker is None
+    assert window.capsule.isHidden() and window.speed_combo.isHidden()
+    assert not window.regenerate_action.isVisible()
+    block = len(window.book.blocks) - 3
+    window.view.clicked.emit(block, 0)
+    wait(500)
+    assert script.asked == [] and window._worker is None  # a click doesn't ask about audio
+    window.view.scroll_to(block, 0, animate=False)
+    window.close()
+    wait_until(lambda: not _threads_running(window))
+    record = Library.load().get(window_book_id(path))
+    assert record.position_block >= block - 3  # where the page was
+    second, _, _ = script.window()
+    second.settings.read_aloud = False
+    pick_from_library(second, record.book_id)
+    wait_until(lambda: second.book is not None and second._task is None)
+    assert second.player.position()[0] == record.position_block and script.asked == []
+    second._change_setting("read_aloud", True)
+    assert not second.capsule.isHidden()
+
+
+def window_book_id(path: Path) -> str:
+    from livrosound.ingest import book_id_for
+
+    return book_id_for(path)
+
+
+# ---------- M4B, chapters, generation only, player only ----------
+
+
+def test_export_m4b_with_chapters(script, tmp_path):
+    window, _, _ = script.window()
+    script.answers["Generate audio from the beginning?"] = True
+    open_book(script, window, write_txt(tmp_path))
+    wait_until(lambda: window._worker is None)
+    assert window.export_actions["m4b"].isEnabled() and window.export_more.isVisible()
+    script.save_as = str(tmp_path / "Rain")
+    window.export_actions["m4b"].trigger()
+    wait_until(lambda: window._export is None, what="the export")
+    info = ffprobe(tmp_path / "Rain.m4b")
+    assert info["chapters"] and info["format"]["format_name"].startswith("mov")
+    assert window.export_button.text() == "Export M4B"  # remembered
+
+
+def _chapter_book(tmp_path: Path) -> Path:
+    path = tmp_path / "chapters.txt"
+    parts = ["THREE CHAPTERS", "by Someone"]
+    for n in ("ONE", "TWO", "THREE"):
+        parts.append(f"CHAPTER {n}")
+        parts += [f"Paragraph {i} of chapter {n.lower()}, with words to read." for i in range(4)]
+    path.write_text("\n\n".join(parts))
+    return path
+
+
+def test_export_chapters_makes_only_those_and_saves_each(script, tmp_path, monkeypatch):
+    window, _, engine = script.window()
+    script.voice = None
+    open_book(script, window, _chapter_book(tmp_path))
+    chapters = mw.export.chapter_blocks(window.book, window.order)
+    assert len(chapters) == 3
+    folder = tmp_path / "out"
+    seen = {}
+
+    def ask(parent, rows, fmt, folder_default, **kwargs):
+        seen["rows"], seen["eta"] = rows, kwargs["eta"]([1])
+        return [1], "mp3", str(folder)
+
+    monkeypatch.setattr(dialogs.ChapterExportDialog, "ask", ask)
+    script.voice = "Aaron"
+    window.export_actions["chapters"].trigger()
+    assert [title for title, _, _ in seen["rows"]] == [c[1] for c in chapters] and seen["eta"].startswith("about")
+    wait_until(lambda: (folder / mw.export.chapter_file_name(2, chapters[1][1], "mp3")).exists()
+               and window._export is None and window._worker is None, what="chapter two's file")
+    made = window.store.generated()
+    assert set(chapters[1][2]) <= made and not set(chapters[2][2]) & made  # only what was chosen
+    assert "Saved “02 - " in window.statusBar().currentMessage()
+
+
+def test_generation_only_mode_makes_the_audio_and_saves_it(script, tmp_path, monkeypatch):
+    window, _, engine = script.window()
+    script.voice = None
+    open_book(script, window, write_txt(tmp_path))
+    monkeypatch.setattr(mw.Path, "home", lambda: tmp_path)
+    engine.hold()
+    script.voice = "Aaron"
+    window.generation_only_action.trigger()
+    assert window.pages.currentWidget() is window.generation_page and window._generation_only
+    assert window._worker is not None and window.view is not None
+    page = window.generation_page
+    assert page.stop_button.isVisible() or not page.stop_button.isHidden()
+    next(b for k, b in page.after_buttons.items() if k == "m4b").click()
+    assert window._after_generation == "m4b"
+    text = window.eta_text()
+    assert text.startswith("About ") and "with the book on screen" in text
+    engine.release()
+    wait_until(lambda: (tmp_path / "Music" / "The Long Rain.m4b").exists() and window._export is None,
+               what="the M4B saved at 100%")
+    assert page.headline.text() == "All the audio is ready"
+    page.back_requested.emit()
+    assert window.pages.currentWidget() is window.reader_page and not window._generation_only
+
+
+def test_player_only_page_follows_the_listening(script, tmp_path):
+    window, outputs, _ = script.window()
+    script.answers["Generate audio from the beginning?"] = True
+    open_book(script, window, _chapter_book(tmp_path))
+    wait_until(lambda: window._worker is None)
+    window.player_button.click()
+    page = window.player_page
+    assert window.pages.currentWidget() is page and len(window._player_chapters) == 3
+    window.toggle_play()
+    play(window, outputs, 1500)
+    window._refresh_audio_pages()
+    assert page.chapter_title.text() == window._player_chapters[0][1]
+    assert page.left_in_book.text().endswith("left in book") and page.remaining.text().startswith("-")
+    lengths = page.chapter_bar._lengths
+    assert len(lengths) == 3 and all(x > 0 for x in lengths)
+    window.toggle_play()
+    page.chapter_requested.emit(2)
+    wait(50)
+    assert window.player.position()[0] == window._player_chapters[2][2][0]
+    page.seek_requested.emit(0.5)
+    block = window.player.position()[0]
+    assert block in window._player_chapters[2][2]
+    page.show_text_requested.emit()
+    assert window.pages.currentWidget() is window.reader_page
+
+
+def test_time_estimates_use_what_this_mac_measured(script, tmp_path):
+    window, _, engine = script.window()
+    script.voice = None
+    open_book(script, window, write_txt(tmp_path))
+    window.settings.rate_normal = 30.0
+    chars = window.remaining_chars()
+    assert chars == sum(window.weights.values())
+    text = window.eta_text()
+    assert text.startswith("The rest takes about ") and "audio-generation only mode" in text
+    assert mw.estimate.duration_text(chars / 30.0) in text

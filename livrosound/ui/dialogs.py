@@ -1,7 +1,7 @@
 """The dialogs on the way from a file to listening, and back to a book later.
 
 Upload: ImportProgressDialog while the book is read → LayoutDialog →
-ChooseVoiceDialog → CustomizeAudioDialog. Resume: LibraryDialog.
+ChooseVoiceDialog → CustomizeAudioDialog. The library page: BookDetailsDialog.
 
 They keep Script Radio's Casting Panel look: a big centered title (castingTitle)
 over a muted subtitle (castingSubtitle), rows of label + switch, a quiet button
@@ -15,15 +15,9 @@ answer (None or "cancel" when the user backs out). Building one without exec()
 gives tests a dialog they can drive.
 
 Non-obvious rules:
-- LibraryDialog removes a book through on_remove(book_id) when given (the main
-  window closes the book if it's open and deletes its files once nothing uses
-  them); otherwise it removes it from the library itself.
 - ChooseVoiceDialog keeps one VoicePreviews per parent window, found again by
   object name on the next opening: a clip still being rendered when the dialog
   closes finishes on a worker thread that must outlive the dialog.
-- LibraryDialog's "34% read" is the share of the book's spoken characters before
-  the saved position; that needs the book's blocks (book.json), so the running
-  sums are cached per book file.
 """
 
 from __future__ import annotations
@@ -52,30 +46,35 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QAbstractButton,
-    QAbstractItemView,
     QButtonGroup,
+    QComboBox,
+    QCompleter,
     QDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
-    QMenu,
     QPushButton,
+    QScrollArea,
     QSlider,
+    QStackedWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
-from .. import paths, voice_preview, voices
+from .. import voice_preview, voices
 from ..book import Book
 from . import theme as themes
-from .theme import ACCENT, ACCENT_HOVER, ON_ACCENT, reading_font, ui_font
-from .widgets import GradientProgressBar, ToggleSwitch, VoicePicker, VoicePreviews, book_pixmap, confirm
+from .theme import ACCENT, ON_ACCENT, reading_font, ui_font
+from .widgets import GradientProgressBar, ToggleSwitch, VoicePicker, VoicePreviews, book_pixmap
 
 if TYPE_CHECKING:
     from ..engines.base import TTSEngine
-    from ..library import BookRecord, Library, Settings
+    from ..library import BookRecord, Settings
 
 PAUSE_RANGE = (0.2, 2.0)  # seconds between paragraphs, in steps of 0.1
 
@@ -726,254 +725,543 @@ class CustomizeAudioDialog(_Dialog):
         self._set("paragraph_pause", tenths / 10)
 
 
-# ---------- Your Books ----------
-
-# Generic covers, one per book (by id), all dark enough for white type.
-COVER_COLORS = ("#4F7942", "#1A4FA8", "#6B4E8A", "#9A4E2E", "#2F5357", "#7A5C2E", "#8A3B52")
-
-# (book id, book.json mtime) -> spoken characters before each block (running sums)
-_progress_cache: dict[tuple[str, int], list[int]] = {}
-
-
-def read_fraction(record: BookRecord) -> float | None:
-    """How much of the book lies before the saved position (by spoken characters),
-    or None when the book's text isn't cached. The main window keeps it on the
-    record as it saves the position; older records are worked out from book.json."""
-    if record.read_fraction >= 0:
-        return min(1.0, record.read_fraction)
-    path = paths.book_dir(record.book_id) / "book.json"
-    try:
-        key = (record.book_id, path.stat().st_mtime_ns)
-    except OSError:
-        return None
-    before = _progress_cache.get(key)
-    if before is None:
-        book = Book.load(path.parent)
-        if book is None:
-            return None
-        before = [0]
-        for block in book.blocks:
-            before.append(before[-1] + (len(block.text) if block.spoken else 0))
-        _progress_cache[key] = before
-    if before[-1] == 0:
-        return None
-    return before[min(max(record.position_block, 0), len(before) - 1)] / before[-1]
+# ---------- Book Details ----------
 
 
 def opened_text(iso: str, today: date) -> str:
-    """'opened today', 'opened yesterday', 'opened Oct 22', 'opened Oct 22, 2025'."""
+    """'today', 'yesterday', 'Oct 22', 'Oct 22, 2025' ('' when unknown)."""
     try:
         day = datetime.fromisoformat(iso).date()
     except ValueError:
         return ""
     if day == today:
-        return "opened today"
+        return "today"
     if (today - day).days == 1:
-        return "opened yesterday"
+        return "yesterday"
     text = f"{day:%b} {day.day}"
-    return f"opened {text}" if day.year == today.year else f"opened {text}, {day.year}"
+    return text if day.year == today.year else f"{text}, {day.year}"
 
 
-def book_status(record: BookRecord, today: date) -> str:
-    """'34% read · audio 100% ready · opened Oct 22'."""
-    parts = []
-    fraction = read_fraction(record)
-    if fraction is not None:
-        percent = math.floor(fraction * 100)
-        if percent > 0:
-            parts.append(f"{percent}% read")
-        else:  # under 1%: somewhere in the first pages, or not started at all
-            parts.append("Just started" if fraction > 0 or record.position_ms > 0 else "Not started")
+def detail_rows(record: BookRecord, today: date) -> list[tuple[str, str]]:
+    """(label, value) for Book Details, leaving out what isn't known."""
+    from .. import shelf
+
+    fraction = shelf.read_fraction(record)
+    status = shelf.status(record)
+    progress = status if status != "Reading" else f"{max(1, math.floor(fraction * 100))}% read"
+    remaining = shelf.seconds_remaining(record)
+    if remaining is not None and status != "Finished":
+        progress += f" · about {shelf.duration_text(remaining)} left to hear"
     ready = 100 if record.generated_fraction >= 1 else math.floor(record.generated_fraction * 100)
-    parts.append(f"audio {ready}% ready" if ready > 0 else "no audio yet")
-    opened = opened_text(record.last_opened, today)
-    if opened:
-        parts.append(opened)
-    return " · ".join(parts)
+    rows = [
+        ("Author", record.author),
+        ("Format", record.source_kind.upper()),
+        ("Pages", str(record.pages) if record.pages else ""),
+        ("Series", record.series + (f", book {record.series_index:g}" if record.series and record.series_index else "")),
+        ("Published", record.published),
+        ("Subjects", ", ".join(shelf.strings(record.subjects))),
+        ("Progress", progress),
+        ("Audio", f"{ready}% made with {record.voice}" if ready and record.voice else "Not made yet"),
+        ("Added", opened_text(record.date_added or record.last_opened, today)),
+        ("Last read", opened_text(record.last_opened, today)),
+        ("File", record.source_path),
+    ]
+    return [(label, value) for label, value in rows if value]
 
 
-def _cover_pixmap(record: BookRecord, width: int = 36, height: int = 48) -> QPixmap:
-    """A plain cover: the title's initial in the reading serif, the format below."""
-    pixmap = QPixmap(width * 2, height * 2)
-    pixmap.setDevicePixelRatio(2.0)
-    pixmap.fill(Qt.GlobalColor.transparent)
-    p = QPainter(pixmap)
-    p.setRenderHint(QPainter.RenderHint.Antialiasing)
-    color = QColor(COVER_COLORS[sum(map(ord, record.book_id)) % len(COVER_COLORS)])
-    p.setPen(Qt.PenStyle.NoPen)
-    p.setBrush(color)
-    p.drawRoundedRect(QRectF(0, 0, width, height), 4, 4)
-    p.setBrush(color.darker(125))
-    p.drawRoundedRect(QRectF(0, 0, 4, height), 2, 2)  # the spine
-    p.setPen(QColor("#FFFFFF"))
-    serif = reading_font(12, QFont.Weight.DemiBold)
-    serif.setPixelSize(20)
-    p.setFont(serif)
-    initial = next((c for c in record.title if c.isalnum()), "")
-    p.drawText(QRectF(3, 4, width - 3, 26), Qt.AlignmentFlag.AlignCenter, initial.upper())
-    label = ui_font(8, QFont.Weight.DemiBold)
-    label.setPixelSize(8)
-    p.setFont(label)
-    p.setPen(QColor(255, 255, 255, 210))
-    p.drawText(QRectF(3, height - 15, width - 3, 11), Qt.AlignmentFlag.AlignCenter, record.source_kind.upper())
-    p.end()
-    return pixmap
+class BookDetailsDialog(_Dialog):
+    """A book's facts (format, pages, series, subjects, progress, audio) and its tags and
+    collections, which the user edits here (comma-separated, names in use offered)."""
 
-
-class _BookRow(QWidget):
-    TEXT_WIDTH = 430  # titles longer than this are elided
-
-    def __init__(self, record: BookRecord, today: date):
-        super().__init__()
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(10, 7, 10, 7)
-        layout.setSpacing(14)
-        cover = QLabel()
-        cover.setPixmap(_cover_pixmap(record))
-        layout.addWidget(cover, 0, Qt.AlignmentFlag.AlignVCenter)
-        texts = QVBoxLayout()
-        texts.setSpacing(1)
-        title_font = ui_font(14, QFont.Weight.DemiBold)
-        self.title = QLabel(_elide(record.title or Path(record.source_path).stem, title_font, self.TEXT_WIDTH))
-        self.title.setFont(title_font)
-        texts.addWidget(self.title)
-        author_font = ui_font(12)
-        self.author = QLabel(_elide(record.author, author_font, self.TEXT_WIDTH))
-        self.author.setFont(author_font)
-        self.author.setVisible(bool(record.author))
-        texts.addWidget(self.author)
-        self.status = QLabel(book_status(record, today))
-        self.status.setObjectName("hint")
-        self.status.setFont(ui_font(11))
-        texts.addWidget(self.status)
-        layout.addLayout(texts, 1)
-
-
-def _elide(text: str, font: QFont, width: int) -> str:
-    return QFontMetrics(font).elidedText(text, Qt.TextElideMode.ElideRight, width)
-
-
-class LibraryDialog(_Dialog):
-    """"Your Books": every book opened, newest first. Double-click or Open to
-    reopen one; right-click to remove it (its text and audio) from the library."""
-
-    ROW_HEIGHT = 70
-
-    def __init__(self, parent: QWidget | None, library: Library, on_remove: Callable[[str], None] | None = None):
-        super().__init__(parent, "Your Books", "Pick up where you left off.")
-        self.setMinimumSize(620, 540)
-        self._library = library
-        self._on_remove = on_remove
-
-        self.frame = QFrame()
-        self.frame.setObjectName("card")
-        frame_layout = QVBoxLayout(self.frame)
-        frame_layout.setContentsMargins(6, 6, 6, 6)
-        self.list = QListWidget()
-        self.list.setObjectName("popoverList")  # the stylesheet's rounded hover and selection rows
-        self.list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
-        self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.list.setFrameShape(QFrame.Shape.NoFrame)
-        self.list.setSpacing(1)
-        self.list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.list.customContextMenuRequested.connect(self._show_menu)
-        self.list.itemDoubleClicked.connect(lambda _item: self.accept())
-        self.list.itemActivated.connect(lambda _item: self.accept())
-        self.list.currentItemChanged.connect(lambda *_: self._update_open())
-        frame_layout.addWidget(self.list)
-        self.empty = _hint("No books yet.\nUpload a book to start listening.", 14)
-        self.empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        frame_layout.addWidget(self.empty, 1)
-        self.body.addWidget(self.frame, 1)
-        hint = _hint("Right-click a book to remove it.", 11)
-        hint.setAlignment(Qt.AlignmentFlag.AlignRight)
-        self.body.addWidget(hint)
-        self._remove_hint = hint
-
+    def __init__(self, parent: QWidget | None, record: BookRecord, tags_in_use: list[str],
+                 collections_in_use: list[str]):
+        super().__init__(parent, record.title or "Untitled", "")
+        self.subtitle_label.hide()
+        self.setMinimumWidth(560)
+        self.title_label.setFont(reading_font(22, QFont.Weight.DemiBold))
+        self.title_label.setWordWrap(True)
+        self._record = record
+        card = QFrame()
+        card.setObjectName("card")
+        grid = QGridLayout(card)
+        grid.setContentsMargins(18, 14, 18, 14)
+        grid.setHorizontalSpacing(18)
+        grid.setVerticalSpacing(8)
+        for row, (label, value) in enumerate(detail_rows(record, date.today())):
+            name = _hint(label, 12)
+            name.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+            text = QLabel(value)
+            text.setFont(ui_font(13))
+            text.setWordWrap(True)
+            text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            grid.addWidget(name, row, 0)
+            grid.addWidget(text, row, 1)
+        grid.setColumnStretch(1, 1)
+        self.body.addWidget(card)
+        self.tags = self._names_field("Tags", record.tags, tags_in_use)
+        self.collections = self._names_field("Collections", record.collections, collections_in_use)
         self.cancel_button = _button("Cancel", "goBackButton")
         self.cancel_button.clicked.connect(self.reject)
-        self.open_button = _button("Open", "generateAudioButton", default=True)
-        self.open_button.setMinimumWidth(120)
-        self.open_button.clicked.connect(self.accept)
-        self._add_buttons(self.cancel_button, self.open_button)
-        self.refresh()
+        self.save_button = _button("Save", "generateAudioButton", default=True)
+        self.save_button.clicked.connect(self.accept)
+        self._add_buttons(self.cancel_button, self.save_button)
+
+    def _names_field(self, label: str, values: list, in_use: list[str]) -> QLineEdit:
+        from .. import shelf
+
+        row = QHBoxLayout()
+        name = QLabel(label)
+        name.setFont(ui_font(14))
+        name.setFixedWidth(96)
+        edit = QLineEdit(", ".join(shelf.strings(values)))
+        edit.setPlaceholderText("Separate names with commas")
+        edit.setFont(ui_font(13))
+        if in_use:
+            completer = QCompleter(in_use, edit)
+            completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+            edit.setCompleter(completer)
+        row.addWidget(name)
+        row.addWidget(edit, 1)
+        self.body.addLayout(row)
+        return edit
+
+    def names(self) -> tuple[list[str], list[str]]:
+        """(tags, collections) as typed."""
+        def split(text: str) -> list[str]:
+            out: list[str] = []
+            for part in text.split(","):
+                part = " ".join(part.split())
+                if part and part.casefold() not in (o.casefold() for o in out):
+                    out.append(part)
+            return out
+
+        return split(self.tags.text()), split(self.collections.text())
 
     @classmethod
-    def ask(
-        cls, parent: QWidget | None, library: Library, on_remove: Callable[[str], None] | None = None
-    ) -> str | None:
-        """The book to open (None: Cancel). on_remove(book_id) does a removal instead of the dialog."""
-        dialog = cls(parent, library, on_remove)
-        return dialog.selected() if dialog.exec() == QDialog.DialogCode.Accepted else None
+    def ask(cls, parent: QWidget | None, record: BookRecord, tags_in_use: list[str],
+            collections_in_use: list[str]) -> tuple[list[str], list[str]] | None:
+        """The (tags, collections) to keep, or None (Cancel)."""
+        dialog = cls(parent, record, tags_in_use, collections_in_use)
+        return dialog.names() if dialog.exec() == QDialog.DialogCode.Accepted else None
 
-    def refresh(self) -> None:
-        """Rebuild the rows from the library, keeping the selection when it's still there."""
-        keep = self.selected()
-        self.list.clear()
-        today = date.today()
-        for record in self._library.recent():
-            item = QListWidgetItem()
-            item.setData(Qt.ItemDataRole.UserRole, record.book_id)
-            item.setSizeHint(QSize(0, self.ROW_HEIGHT))
-            self.list.addItem(item)
-            self.list.setItemWidget(item, _BookRow(record, today))
-            if record.book_id == keep:
-                self.list.setCurrentItem(item)
-        if self.list.currentItem() is None and self.list.count():
-            self.list.setCurrentRow(0)
-        empty = self.list.count() == 0
-        self.list.setVisible(not empty)
-        self.empty.setVisible(empty)
-        self._remove_hint.setVisible(not empty)
-        self._update_open()
 
-    def selected(self) -> str | None:
-        item = self.list.currentItem()
-        return item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+# ---------- Settings ----------
 
-    def remove(self, book_id: str) -> bool:
-        """Ask, then forget the book and delete its text and audio (never the file itself)."""
-        record = self._library.get(book_id)
-        if record is None:
-            return False
-        if not confirm(
-            self,
-            f"Remove “{record.title}” from your library?",
-            "Its text and audio are deleted from this Mac. Your file stays where it is.",
-            yes="Remove",
-            no="Cancel",
-            destructive=True,
-        ):
-            return False
-        if self._on_remove is not None:
-            self._on_remove(book_id)
-        else:
-            self._library.remove(book_id)
-            self._library.save()
-        self.refresh()
-        return True
+WEIGHTS = {300: "Light", 400: "Regular", 500: "Medium", 600: "Semibold", 700: "Bold"}
+DEFAULT_FONT_LABEL = "Iowan Old Style (default)"
+SHORTCUTS = (
+    ("Space", "Play or pause"),
+    ("← / →", "Back or forward 10 seconds"),
+    ("↑ / ↓, Page Up / Page Down", "Turn the page (single and double page)"),
+    ("⌘F", "Find in the book"),
+    ("⌘G / ⇧⌘G", "Next or previous match"),
+    ("⌘+ / ⌘−", "Larger or smaller text"),
+    ("⌘O", "Upload a new book"),
+    ("⇧⌘L", "Go to Library"),
+    ("⌘,", "Settings"),
+)
 
-    def context_menu(self, book_id: str) -> QMenu:
-        """The right-click menu of a row."""
-        t = themes.current()
-        menu = QMenu(self)
-        menu.setStyleSheet(
-            f"QMenu {{ background: {t.panel}; color: {t.text}; border: 1px solid {t.line};"
-            f" border-radius: 8px; padding: 4px; }}"
-            f" QMenu::item {{ padding: 5px 16px; border-radius: 5px; }}"
-            f" QMenu::item:selected {{ background: {ACCENT_HOVER}; color: {ON_ACCENT}; }}"
+
+class SettingsDialog(_Dialog):
+    """Everything the reader can tune, in tabs (Readest's Settings): Font, Layout,
+    Color, Reading, General and Shortcuts. Every change goes into Settings at once
+    and is announced with changed(field) so the window applies it live; the
+    window saves."""
+
+    changed = Signal(str)
+    TABS = ("Font", "Layout", "Color", "Reading", "General", "Shortcuts")
+
+    def __init__(self, parent: QWidget | None, settings: Settings, *, add_font: Callable[[], list[str]] | None = None,
+                 pick_color: Callable[[str, str], str | None] | None = None):
+        super().__init__(parent, "Settings", "")
+        self.subtitle_label.hide()
+        self.setMinimumSize(600, 620)
+        self._settings = settings
+        self._add_font = add_font
+        self._pick_color = pick_color or _pick_color
+        self.controls: dict[str, QWidget] = {}
+        from .widgets import segmented_control
+
+        tabs, self.tab_buttons = segmented_control([(t, t, "") for t in self.TABS], "Font", self.show_tab, self)
+        self.body.addWidget(tabs)
+        self.pages = QStackedWidget()
+        for build in (self._font_tab, self._layout_tab, self._color_tab, self._reading_tab, self._general_tab,
+                      self._shortcuts_tab):
+            page = QWidget()
+            layout = QVBoxLayout(page)
+            layout.setContentsMargins(6, 10, 6, 6)
+            layout.setSpacing(6)
+            build(layout)
+            layout.addStretch(1)
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.Shape.NoFrame)
+            scroll.setWidget(page)
+            self.pages.addWidget(scroll)
+        self.body.addWidget(self.pages, 1)
+        done = _button("Done", "generateAudioButton", default=True)
+        done.clicked.connect(self.accept)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(done)
+        self.body.addLayout(row)
+        self.done_button = done
+
+    @classmethod
+    def ask(cls, parent: QWidget | None, settings: Settings, on_change: Callable[[str], None], **kwargs) -> None:
+        dialog = cls(parent, settings, **kwargs)
+        dialog.changed.connect(on_change)
+        dialog.exec()
+
+    def show_tab(self, name: str) -> None:
+        self.pages.setCurrentIndex(self.TABS.index(name))
+        self.tab_buttons[name].setChecked(True)
+
+    def _set(self, field: str, value) -> None:
+        if getattr(self._settings, field) != value:
+            setattr(self._settings, field, value)
+            self.changed.emit(field)
+
+    # ---------- rows ----------
+
+    def _slider(self, layout: QVBoxLayout, field: str, label: str, low: float, high: float, step: float,
+                show: Callable[[float], str], *, scale: float = 1.0) -> QSlider:
+        """A labeled slider for a numeric setting (value = slider position × step)."""
+        title = QLabel()
+        title.setFont(ui_font(13))
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(round(low / step), round(high / step))
+        slider.setCursor(Qt.CursorShape.PointingHandCursor)
+        slider.setStyleSheet(f"QSlider::sub-page:horizontal {{ background: {ACCENT}; border-radius: 3px; }}")
+        value = getattr(self._settings, field) / scale
+        slider.setValue(round(value / step))
+
+        def moved(position: int):
+            number = position * step
+            title.setText(f"{label}: {show(number)}")
+            kind = type(getattr(self._settings, field))
+            self._set(field, kind(round(number * scale, 3)) if kind is float else kind(round(number * scale)))
+
+        slider.valueChanged.connect(moved)
+        title.setText(f"{label}: {show(slider.value() * step)}")
+        layout.addSpacing(4)
+        layout.addWidget(title)
+        layout.addWidget(slider)
+        self.controls[field] = slider
+        return slider
+
+    def _switch(self, layout: QVBoxLayout, field: str, text: str, hint: str = "") -> ToggleSwitch:
+        row = _SwitchRow(text, bool(getattr(self._settings, field)), hint=hint)
+        row.switch.toggled.connect(lambda on: self._set(field, on))
+        layout.addWidget(row)
+        self.controls[field] = row.switch
+        return row.switch
+
+    def _segments(self, layout: QVBoxLayout, field: str, label: str, choices) -> dict[str, QToolButton]:
+        from .widgets import segmented_control
+
+        caption = QLabel(label)
+        caption.setFont(ui_font(13))
+        layout.addSpacing(4)
+        layout.addWidget(caption)
+        frame, buttons = segmented_control(choices, getattr(self._settings, field), lambda k: self._set(field, k), self)
+        layout.addWidget(frame)
+        self.controls[field] = frame
+        return buttons
+
+    # ---------- tabs ----------
+
+    def _font_tab(self, layout: QVBoxLayout) -> None:
+        from . import fonts
+
+        caption = QLabel("Font")
+        caption.setFont(ui_font(13))
+        layout.addWidget(caption)
+        row = QHBoxLayout()
+        self.font_combo = QComboBox()
+        self.font_combo.setFont(ui_font(13))
+        self._fill_fonts(fonts.families())
+        self.font_combo.currentIndexChanged.connect(
+            lambda _i: self._set("font_family", self.font_combo.currentData() or "")
         )
-        menu.setFont(ui_font(13))
-        action = menu.addAction("Remove from Library…")
-        action.triggered.connect(lambda: self.remove(book_id))
-        return menu
+        add = _button("Add Font…", "secondaryButton")
+        add.setToolTip("Use a font file of your own (.ttf, .otf, .ttc)")
+        add.clicked.connect(self._on_add_font)
+        add.setEnabled(self._add_font is not None)
+        row.addWidget(self.font_combo, 1)
+        row.addWidget(add)
+        layout.addLayout(row)
+        self.add_font_button = add
+        self.font_sample = QLabel("The quick brown fox jumps over the lazy dog.")
+        self.font_sample.setWordWrap(True)
+        layout.addWidget(self.font_sample)
+        self._slider(layout, "font_weight", "Weight", 300, 700, 100, lambda v: WEIGHTS.get(round(v), str(round(v))))
+        self._slider(layout, "reflow_font_size", "Size", 12, 40, 1, lambda v: f"{v:g} pt")
+        self.changed.connect(lambda field: self._show_sample() if field.startswith("font") or field == "reflow_font_size" else None)
+        self._show_sample()
 
-    def _show_menu(self, pos):
-        item = self.list.itemAt(pos)
-        if item is None:
-            return
-        self.list.setCurrentItem(item)
-        self.context_menu(item.data(Qt.ItemDataRole.UserRole)).exec(self.list.viewport().mapToGlobal(pos))
+    def _fill_fonts(self, names: list[str]) -> None:
+        self.font_combo.blockSignals(True)
+        self.font_combo.clear()
+        self.font_combo.addItem(DEFAULT_FONT_LABEL, "")
+        for name in names:
+            self.font_combo.addItem(name, name)
+        index = self.font_combo.findData(self._settings.font_family)
+        self.font_combo.setCurrentIndex(max(0, index))
+        self.font_combo.blockSignals(False)
 
-    def _update_open(self):
-        self.open_button.setEnabled(self.selected() is not None)
+    def _show_sample(self) -> None:
+        s = self._settings
+        self.font_sample.setFont(reading_font(min(28, s.reflow_font_size), QFont.Weight(s.font_weight), s.font_family))
+
+    def _on_add_font(self) -> None:
+        from . import fonts
+
+        added = self._add_font() if self._add_font is not None else []
+        if added:
+            self._fill_fonts(sorted(set(fonts.families()) | set(added), key=str.casefold))
+            self.font_combo.setCurrentIndex(max(0, self.font_combo.findData(added[0])))
+
+    def _layout_tab(self, layout: QVBoxLayout) -> None:
+        from .widgets import PAGE_VIEWS
+
+        self._segments(layout, "page_view", "Page view", PAGE_VIEWS)
+        self._slider(layout, "line_spacing", "Line spacing", 1.0, 2.6, 0.1, lambda v: f"{v:.1f}×")
+        self._slider(layout, "paragraph_spacing", "Paragraph spacing", 0.0, 2.0, 0.1, lambda v: f"{v:.1f} em")
+        self._slider(layout, "word_spacing", "Word spacing", 0, 12, 1, lambda v: f"+{v:g} px" if v else "normal")
+        self._slider(layout, "letter_spacing", "Letter spacing", 0, 4, 0.5, lambda v: f"+{v:g} px" if v else "normal")
+        self._switch(layout, "justify", "Justify paragraphs", "Even right edges, like a printed page.")
+        centered = _SwitchRow("Center the text", self._settings.margin_left < 0 and self._settings.margin_right < 0,
+                              hint="Turn off to set the left and right margins yourself.")
+        layout.addWidget(centered)
+        self.controls["centered"] = centered.switch
+        sliders = []
+        for field, label in (("margin_left", "Left margin"), ("margin_right", "Right margin")):
+            slider = self._slider(layout, field, label, 0, 400, 4, lambda v: f"{v:g} px")
+            sliders.append((field, slider))
+
+        def center(on: bool):
+            for field, slider in sliders:
+                slider.setEnabled(not on)
+                if on:
+                    self._set(field, -1)
+                else:
+                    self._set(field, max(0, slider.value() * 4) or 64)
+
+        centered.switch.toggled.connect(center)
+        for field, slider in sliders:
+            slider.setEnabled(not centered.switch.isChecked())
+            if getattr(self._settings, field) < 0:
+                slider.blockSignals(True)
+                slider.setValue(16)
+                slider.blockSignals(False)
+        self._slider(layout, "max_column", "Widest text column", 400, 1600, 20, lambda v: f"{v:g} px")
+
+    def _color_tab(self, layout: QVBoxLayout) -> None:
+        from .widgets import ThemeCard
+
+        grid = QGridLayout()
+        grid.setSpacing(10)
+        group = QButtonGroup(self)
+        self.theme_cards: dict[str, ThemeCard] = {}
+        for i, key in enumerate([*themes.THEMES, "custom"]):
+            card = ThemeCard(key)
+            card.setChecked(key == self._settings.theme)
+            card.clicked.connect(lambda _=False, k=key: self._set("theme", k))
+            group.addButton(card)
+            grid.addWidget(card, i // 3, i % 3)
+            self.theme_cards[key] = card
+        layout.addLayout(grid)
+        row = QHBoxLayout()
+        caption = QLabel("Custom theme")
+        caption.setFont(ui_font(13))
+        row.addWidget(caption)
+        row.addStretch(1)
+        for field, label in (("custom_page", "Paper…"), ("custom_text", "Text…")):
+            button = _button(label, "secondaryButton")
+            button.clicked.connect(lambda _=False, f=field, t=label: self._choose_color(f, t))
+            row.addWidget(button)
+            self.controls[field] = button
+        layout.addLayout(row)
+        layout.addWidget(_hairline_frame())
+        self._switch(layout, "auto_mode", "Auto Mode", "Follow macOS: one theme in Light appearance, another in Dark.")
+        for field, label in (("light_theme", "In Light appearance"), ("dark_theme", "In Dark appearance")):
+            row = QHBoxLayout()
+            name = QLabel(label)
+            name.setFont(ui_font(13))
+            combo = QComboBox()
+            for key in [*themes.THEMES, "custom"]:
+                combo.addItem(themes.theme_for(key).name, key)
+            combo.setCurrentIndex(max(0, combo.findData(getattr(self._settings, field))))
+            combo.currentIndexChanged.connect(lambda _i, f=field, c=combo: self._set(f, c.currentData()))
+            row.addWidget(name)
+            row.addStretch(1)
+            row.addWidget(combo)
+            layout.addLayout(row)
+            self.controls[field] = combo
+
+    def _choose_color(self, field: str, title: str) -> None:
+        color = self._pick_color(getattr(self._settings, field), title.rstrip("…"))
+        if color:
+            self._set(field, color)
+            for card in self.theme_cards.values():
+                card.update()
+
+    def _reading_tab(self, layout: QVBoxLayout) -> None:
+        from .widgets import HIGHLIGHT_UNITS
+
+        self._switch(layout, "read_aloud", "Read books aloud",
+                     "Off: LivroSound is an e-reader only. No audio is made or played.")
+        self._switch(layout, "highlight", "Highlight while reading")
+        self._segments(layout, "highlight_unit", "Highlighter", HIGHLIGHT_UNITS)
+        layout.addWidget(_hint("Word by word follows the narrator's timing within each sentence (an estimate).", 11))
+        self._switch(layout, "show_page_numbers", "Show page numbers")
+        self._switch(layout, "show_read_percent", "Show how much you've read")
+        self._switch(layout, "always_show_status_bar", "Always show the status bar",
+                     "Otherwise the page and progress fade while you read.")
+
+    def _general_tab(self, layout: QVBoxLayout) -> None:
+        self._switch(layout, "open_last_book", "Open last book on start", "Skip the start page and continue reading.")
+        self._switch(layout, "auto_import", "Auto import on file open",
+                     "A book opened with LivroSound from Finder, or dropped on its window, joins your library at once.")
+
+    def _shortcuts_tab(self, layout: QVBoxLayout) -> None:
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(24)
+        grid.setVerticalSpacing(10)
+        for row, (keys, action) in enumerate(SHORTCUTS):
+            key = QLabel(keys)
+            key.setFont(ui_font(13, QFont.Weight.DemiBold))
+            grid.addWidget(key, row, 0)
+            grid.addWidget(QLabel(action), row, 1)
+        grid.setColumnStretch(1, 1)
+        layout.addLayout(grid)
+
+
+def _hairline_frame() -> QFrame:
+    line = QFrame()
+    line.setObjectName("hairline")
+    line.setFixedHeight(1)
+    return line
+
+
+def _pick_color(current: str, title: str) -> str | None:
+    from PySide6.QtWidgets import QColorDialog
+
+    color = QColorDialog.getColor(QColor(current), None, title)
+    return color.name() if color.isValid() else None
+
+
+# ---------- Export Chapters ----------
+
+
+class ChapterExportDialog(_Dialog):
+    """Pick chapters to save as files of their own (MP3 or M4B, into a folder).
+    Chapters whose audio isn't made yet are made first, and each is saved as soon
+    as it's done, so the first ones can be heard before the rest is ready.
+    Each chapter: (title, length text, ready)."""
+
+    def __init__(self, parent: QWidget | None, chapters: list[tuple[str, str, bool]], fmt: str, folder: str,
+                 eta: Callable[[list[int]], str] | None = None, choose_folder: Callable[[str], str] | None = None):
+        super().__init__(parent, "Export Chapters", "Each chapter becomes its own audio file.")
+        self.setMinimumSize(560, 560)
+        self._eta = eta
+        self._choose_folder = choose_folder or _choose_folder
+        self.folder = folder
+        from .widgets import segmented_control
+
+        self.list = QListWidget()
+        self.list.setObjectName("popoverList")
+        self.list.setFrameShape(QFrame.Shape.NoFrame)
+        for title, length, ready in chapters:
+            item = QListWidgetItem(f"{title}\n{length} · {'ready' if ready else 'not made yet'}")
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Unchecked)
+            item.setFont(ui_font(13))
+            self.list.addItem(item)
+        self.list.itemChanged.connect(lambda _item: self._update())
+        card = QFrame()
+        card.setObjectName("card")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(6, 6, 6, 6)
+        card_layout.addWidget(self.list)
+        self.body.addWidget(card, 1)
+        row = QHBoxLayout()
+        self.all_button = _button("Select All", "secondaryButton")
+        self.all_button.clicked.connect(self._select_all)
+        row.addWidget(self.all_button)
+        row.addStretch(1)
+        self.fmt = fmt
+        frame, self.format_buttons = segmented_control(
+            [("mp3", "MP3", "Plays everywhere"), ("m4b", "M4B", "An audiobook, like Audible's")], fmt,
+            self._set_format, self,
+        )
+        frame.setFixedWidth(200)
+        row.addWidget(frame)
+        self.body.addLayout(row)
+        folder_row = QHBoxLayout()
+        self.folder_label = _hint("", 12)
+        folder_row.addWidget(self.folder_label, 1)
+        change = _button("Choose Folder…", "secondaryButton")
+        change.clicked.connect(self._change_folder)
+        folder_row.addWidget(change)
+        self.body.addLayout(folder_row)
+        self.summary = _hint("", 12)
+        self.body.addWidget(self.summary)
+        self.cancel_button = _button("Cancel", "goBackButton")
+        self.cancel_button.clicked.connect(self.reject)
+        self.export_button = _button("Export", "generateAudioButton", default=True)
+        self.export_button.clicked.connect(self.accept)
+        self._add_buttons(self.cancel_button, self.export_button)
+        self._ready = [r for _, _, r in chapters]
+        self._update()
+
+    def chosen(self) -> list[int]:
+        return [i for i in range(self.list.count()) if self.list.item(i).checkState() == Qt.CheckState.Checked]
+
+    def _select_all(self) -> None:
+        on = len(self.chosen()) < self.list.count()
+        for i in range(self.list.count()):
+            self.list.item(i).setCheckState(Qt.CheckState.Checked if on else Qt.CheckState.Unchecked)
+
+    def _set_format(self, fmt: str) -> None:
+        self.fmt = fmt
+
+    def _change_folder(self) -> None:
+        folder = self._choose_folder(self.folder)
+        if folder:
+            self.folder = folder
+            self._update()
+
+    def _update(self) -> None:
+        chosen = self.chosen()
+        self.folder_label.setText(f"Saved in {self.folder}")
+        missing = [i for i in chosen if not self._ready[i]]
+        self.export_button.setEnabled(bool(chosen))
+        self.export_button.setText("Generate & Export" if missing else "Export")
+        if not chosen:
+            self.summary.setText("Tick the chapters you want.")
+        elif missing:
+            eta = self._eta(missing) if self._eta else ""
+            self.summary.setText(
+                f"{len(missing)} of them still need their audio made{f' ({eta})' if eta else ''}; "
+                "each is saved as soon as it's ready."
+            )
+        else:
+            self.summary.setText(f"{len(chosen)} chapter{'' if len(chosen) == 1 else 's'} ready to save.")
+        self.all_button.setText("Select None" if chosen and len(chosen) == self.list.count() else "Select All")
+
+    @classmethod
+    def ask(cls, parent: QWidget | None, chapters: list[tuple[str, str, bool]], fmt: str, folder: str,
+            **kwargs) -> tuple[list[int], str, str] | None:
+        """(chosen chapter indices, "mp3" | "m4b", folder), or None (Cancel)."""
+        dialog = cls(parent, chapters, fmt, folder, **kwargs)
+        if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.chosen():
+            return None
+        return dialog.chosen(), dialog.fmt, dialog.folder
+
+
+def _choose_folder(current: str) -> str:
+    from PySide6.QtWidgets import QFileDialog
+
+    return QFileDialog.getExistingDirectory(None, "Save Chapters In", current)
