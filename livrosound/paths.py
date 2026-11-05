@@ -43,3 +43,8 @@ def library_path() -> Path:
 
 def voice_previews_dir() -> Path:
     return cache_dir() / "voice_previews"
+
+
+def fonts_dir() -> Path:
+    """Fonts the user added (Settings ▸ Font ▸ Add Font…)."""
+    return cache_dir() / "fonts"

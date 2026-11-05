@@ -446,3 +446,60 @@ def test_every_dialog_paints(host, key, library, renders):
         dialog.done(0)
     voice.previews.shutdown()
     themes.set_current(THEMES["original"])
+
+
+# ---------- Settings ----------
+
+
+def test_settings_tabs_change_settings_live(host):
+    settings = Settings()
+    changes = []
+    dialog = d.SettingsDialog(host, settings, add_font=lambda: [], pick_color=lambda current, title: "#102030")
+    dialog.changed.connect(changes.append)
+    assert [b.text() for b in dialog.tab_buttons.values()] == list(d.SettingsDialog.TABS)
+    dialog.show_tab("Layout")
+    assert dialog.pages.currentIndex() == 1
+    dialog.controls["line_spacing"].setValue(20)
+    assert settings.line_spacing == 2.0 and changes[-1] == "line_spacing"
+    dialog.controls["word_spacing"].setValue(3)
+    assert settings.word_spacing == 3.0
+    dialog.controls["justify"].setChecked(True)
+    assert settings.justify
+    # Margins: centered until the switch is turned off, then the sliders set them.
+    assert not dialog.controls["margin_left"].isEnabled()
+    dialog.controls["centered"].setChecked(False)
+    assert settings.margin_left == 64 and dialog.controls["margin_left"].isEnabled()
+    dialog.controls["margin_left"].setValue(50)
+    assert settings.margin_left == 200
+    dialog.controls["centered"].setChecked(True)
+    assert (settings.margin_left, settings.margin_right) == (-1, -1)
+    dialog.controls["font_weight"].setValue(6)
+    assert settings.font_weight == 600
+    dialog.font_combo.addItem("Courier", "Courier")
+    dialog.font_combo.setCurrentIndex(dialog.font_combo.count() - 1)
+    assert settings.font_family == "Courier"
+    dialog.theme_cards["calm"].click()
+    assert settings.theme == "calm"
+    dialog._choose_color("custom_page", "Paper…")
+    assert settings.custom_page == "#102030"
+    dialog.controls["highlight_unit"].findChildren(QWidget)  # the segmented control exists
+    page_buttons = dialog.controls["page_view"].findChildren(d.QToolButton)
+    next(b for b in page_buttons if b.text() == "Double").click()
+    assert settings.page_view == "double"
+    unit = next(b for b in dialog.controls["highlight_unit"].findChildren(d.QToolButton) if b.text() == "Word")
+    unit.click()
+    assert settings.highlight_unit == "word"
+    for field in ("open_last_book", "auto_import", "always_show_status_bar", "show_page_numbers"):
+        dialog.controls[field].toggle()
+    assert settings.open_last_book and not settings.auto_import and settings.always_show_status_bar
+    assert not settings.show_page_numbers
+    assert {"page_view", "highlight_unit", "custom_page", "theme"} <= set(changes)
+
+
+def test_custom_theme_colors(qapp):
+    custom = themes.set_custom_colors("#1E2A20", "#E8F0E0")
+    assert themes.theme_for("custom") is custom and custom.dark and custom.page == "#1e2a20"
+    light = themes.set_custom_colors("#FAF0DC", "#202020")
+    assert not light.dark and light.text == "#202020" and light.highlight != light.page
+    themes.set_custom_colors("not a color", "#000000")
+    assert themes.theme_for("custom") is light

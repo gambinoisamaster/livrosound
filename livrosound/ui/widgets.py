@@ -773,10 +773,10 @@ class ThemeCard(QAbstractButton):
         self.setCheckable(True)
         self.setFixedSize(118, 92)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setToolTip(f"{THEMES[key].name} theme")
+        self.setToolTip(f"{themes.theme_for(key).name} theme")
 
     def paintEvent(self, event):
-        shown, card = themes.current(), THEMES[self.key]
+        shown, card = themes.current(), themes.theme_for(self.key)
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         r = QRectF(2, 2, self.width() - 4, self.height() - 4)
@@ -796,22 +796,67 @@ class ThemeCard(QAbstractButton):
         p.drawText(QRectF(r.x(), r.y() + 52, r.width(), 24), Qt.AlignmentFlag.AlignCenter, card.name)
 
 
+def segmented_control(choices: list[tuple[str, str, str]], current: str, on_choose: Callable[[str], None],
+              parent: QWidget) -> tuple[QFrame, dict[str, QToolButton]]:
+    """A macOS segmented control: (key, label, tooltip) per segment, one checked."""
+    frame = QFrame()
+    frame.setObjectName("segmented")
+    frame.setFixedHeight(40)
+    row = QHBoxLayout(frame)
+    row.setContentsMargins(4, 4, 4, 4)
+    row.setSpacing(2)
+    buttons: dict[str, QToolButton] = {}
+    group = QButtonGroup(parent)
+    for key, text, tip in choices:
+        button = QToolButton()
+        button.setText(text)
+        button.setCheckable(True)
+        button.setChecked(key == current)
+        button.setFont(ui_font(13, QFont.Weight.Medium))
+        button.setFixedHeight(32)
+        button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.setToolTip(tip)
+        button.clicked.connect(lambda _=False, k=key: on_choose(k))
+        group.addButton(button)
+        row.addWidget(button, 1)
+        buttons[key] = button
+    return frame, buttons
+
+
+PAGE_VIEWS = [
+    ("scroll", "Scroll", "Continuous scroll"),
+    ("single", "Single", "One page at a time"),
+    ("double", "Double", "Two pages side by side"),
+]
+HIGHLIGHT_UNITS = [
+    ("word", "Word", "Light up each word as it's read"),
+    ("sentence", "Sentence", "Light up the sentence being read"),
+    ("paragraph", "Paragraph", "Light up the paragraph being read"),
+]
+
+
 class ThemesPopover(Popover):
-    """Themes & Settings ("Aa"): text size, light/dark, the four reading themes,
-    the layout (the book's own or LivroSound's) and the sentence highlight."""
+    """Themes & Settings ("Aa"): text size, light/dark, the reading themes, the
+    layout (the book's own or LivroSound's), the page view, the highlighter, and
+    More Settings… (the Settings window)."""
 
     theme_chosen = Signal(str)
     text_size_step = Signal(int)  # -1 smaller, +1 larger
     layout_chosen = Signal(str)  # "original" | "livrosound"
     highlight_toggled = Signal(bool)
+    page_view_chosen = Signal(str)  # see PAGE_VIEWS
+    highlight_unit_chosen = Signal(str)  # see HIGHLIGHT_UNITS
+    settings_requested = Signal()
 
     LAYOUTS = (
         ("original", "Original", "The book as it was designed: its pages, fonts and layout"),
         ("livrosound", "LivroSound", "Clean, adjustable text, like Apple Books"),
     )
 
-    def __init__(self, parent: QWidget | None, current_key: str, *, layout: str = "livrosound", highlight: bool = True):
-        super().__init__(parent, width=290)
+    def __init__(self, parent: QWidget | None, current_key: str, *, layout: str = "livrosound", highlight: bool = True,
+                 page_view: str = "scroll", highlight_unit: str = "sentence"):
+        super().__init__(parent, width=300)
         self.body.addWidget(_popover_title("Themes & Settings"))
         self.body.addWidget(_hairline())
 
@@ -855,7 +900,7 @@ class ThemesPopover(Popover):
         grid.setSpacing(10)
         self.cards: dict[str, ThemeCard] = {}
         cards = QButtonGroup(self)
-        for i, key in enumerate(THEMES):
+        for i, key in enumerate([*THEMES, "custom"]):
             card = ThemeCard(key)
             card.clicked.connect(lambda _=False, k=key: self.theme_chosen.emit(k))
             cards.addButton(card)
@@ -891,9 +936,16 @@ class ThemesPopover(Popover):
             self.layout_buttons[mode] = button
         self.body.addWidget(layouts)
 
+        caption = QLabel("Pages")
+        caption.setObjectName("caption")
+        caption.setFont(ui_font(11, QFont.Weight.DemiBold))
+        self.body.addWidget(caption)
+        frame, self.page_view_buttons = segmented_control(PAGE_VIEWS, page_view, self.page_view_chosen.emit, self)
+        self.body.addWidget(frame)
+
         switch_row = QHBoxLayout()
         switch_row.setContentsMargins(2, 2, 2, 0)
-        label = QLabel("Highlight sentences")
+        label = QLabel("Highlight while reading")
         label.setFont(ui_font(13))
         self.highlight_switch = ToggleSwitch()
         self.highlight_switch.toggled.connect(self.highlight_toggled)
@@ -901,6 +953,17 @@ class ThemesPopover(Popover):
         switch_row.addStretch(1)
         switch_row.addWidget(self.highlight_switch, 0, Qt.AlignmentFlag.AlignVCenter)
         self.body.addLayout(switch_row)
+        frame, self.unit_buttons = segmented_control(HIGHLIGHT_UNITS, highlight_unit, self.highlight_unit_chosen.emit, self)
+        self.body.addWidget(frame)
+        self.body.addWidget(_hairline())
+        more = QPushButton("More Settings…")
+        more.setObjectName("secondaryButton")
+        more.setFixedHeight(32)
+        more.setCursor(Qt.CursorShape.PointingHandCursor)
+        more.setToolTip("Fonts, margins, spacing, colors and more (⌘,)")
+        more.clicked.connect(lambda: (self.close(), self.settings_requested.emit()))
+        self.body.addWidget(more)
+        self.more_button = more
 
         self._key = current_key
         self._layout = layout

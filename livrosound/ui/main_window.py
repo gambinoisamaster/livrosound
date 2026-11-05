@@ -92,17 +92,18 @@ from ..engines.base import TTSEngine
 from ..generation import GenerationCancelled, Generator, stream_ready
 from ..ingest import SUPPORTED_SUFFIXES, BookImportError, ImportCancelled, book_id_for, load_book
 from ..library import BookRecord, Library, Settings, audio_signature
-from ..sentences import split_sentences
+from ..sentences import split_sentences, word_at
 from ..timeline import Timeline
 from ..validate import Transcriber
-from . import dialogs
+from . import dialogs, fonts
 from . import theme as themes
 from .landing import LivroSoundLanding
 from .library_page import LibraryPage
 from .page_view import MAX_ZOOM, MIN_ZOOM, PageView
 from .player import BookPlayer, QtSinkOutput
+from .reader_view import ReadingStyle
 from .reflow_view import ReflowView
-from .theme import Theme, theme_for, tooltip_stylesheet
+from .theme import Theme, theme_for, tooltip_stylesheet, ui_font
 from .widgets import (
     ContentsPopover,
     GradientProgressBar,
@@ -126,6 +127,10 @@ WAIT_AHEAD_CHARS = 2000
 PICK_A_START = "Click any part of the text, or choose a chapter from Contents, to start generating audio from there."
 IMPORT_PROGRESS_DELAY_MS = 300  # a cached book opens without flashing the progress dialog
 READY_SOUND = paths.ASSETS_DIR / "sounds" / "ready.wav"
+INFO_FADE_MS = 3000  # the page and progress fade this long after the reader last moved
+PAGE_COUNT_DELAY_MS = 400  # counting a reflowed book's pages waits for resizing to settle
+STYLE_FIELDS = ("font_family", "font_weight", "line_spacing", "paragraph_spacing", "word_spacing",
+                "letter_spacing", "justify", "margin_left", "margin_right", "max_column")
 BOOK_FILTER = "Books (*.pdf *.epub *.docx *.txt)"
 PREVIEW_SIZE = QSize(488, 496)  # LayoutDialog thumbnails, rendered at twice the card's size
 
@@ -324,6 +329,7 @@ class MainWindow(QMainWindow):
 
         self.engine = engine or load_engines()[0]  # Pocket-TTS (tests pass a fake)
         self.settings = Settings.load()
+        fonts.load_user_fonts()  # the fonts the user added, so their choice is there to read in
         self.library = Library.load()
         self.transcriber = Transcriber()
         self.theme: Theme = theme_for(self.settings.theme)
@@ -355,6 +361,7 @@ class MainWindow(QMainWindow):
         self._follow_block = -1  # the block auto-follow last scrolled to
         self._highlight: tuple[int, int, int] | None = None  # (block, start, end) shown now
         self._position_block = -1
+        self._info_block = -1  # the block the page/progress line was last worked out for
         self._saved_position: tuple[int, int] | None = None
         self._at_end = False
 
@@ -408,6 +415,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.pages)
         self.setAcceptDrops(True)  # a book dropped on the window opens (Auto Import on File Open)
         QGuiApplication.styleHints().colorSchemeChanged.connect(lambda _scheme: self._follow_appearance())
+        themes.set_custom_colors(self.settings.custom_page, self.settings.custom_text)
         self._restyle(self._effective_theme())
         self._show_landing()
         if output_factory is None:
@@ -429,6 +437,18 @@ class MainWindow(QMainWindow):
         self.library_action.triggered.connect(self.show_library)
         file_menu.addAction(self.upload_action)
         file_menu.addAction(self.library_action)
+        self.settings_action = QAction("Settings…", self)
+        self.settings_action.setShortcut(QKeySequence("Ctrl+,"))
+        self.settings_action.setMenuRole(QAction.MenuRole.PreferencesRole)
+        self.settings_action.triggered.connect(self.open_settings)
+        file_menu.addAction(self.settings_action)
+        view_menu = self.menuBar().addMenu("View")
+        for text, keys, step in (("Larger Text", "Ctrl++", 1), ("Smaller Text", "Ctrl+-", -1)):
+            action = QAction(text, self)
+            action.setShortcuts([QKeySequence(keys)] + ([QKeySequence("Ctrl+=")] if step > 0 else []))
+            action.triggered.connect(lambda _=False, s=step: self._step_text_size(s) if self._reading() else None)
+            view_menu.addAction(action)
+        self.view_menu = view_menu
         # About in the app menu (macOS moves it there), and Help ▸ Credits.
         help_menu = self.menuBar().addMenu("Help")
         about = QAction("About LivroSound", self)
@@ -532,6 +552,22 @@ class MainWindow(QMainWindow):
         self.cancel_button.hide()
         self.stage.installEventFilter(self)
 
+        # Bottom left of the page: "Page 12 of 340 · 34%", fading while reading
+        # unless Always Show Status Bar is on.
+        self.reading_info = QLabel(self.stage)
+        self.reading_info.setObjectName("readingInfo")
+        self.reading_info.setFont(ui_font(11, QFont.Weight.Medium))
+        self.reading_info.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.reading_info.hide()
+        self._info_timer = QTimer(self)
+        self._info_timer.setSingleShot(True)
+        self._info_timer.setInterval(INFO_FADE_MS)
+        self._info_timer.timeout.connect(self._fade_reading_info)
+        self._page_count_timer = QTimer(self)
+        self._page_count_timer.setSingleShot(True)
+        self._page_count_timer.setInterval(PAGE_COUNT_DELAY_MS)
+        self._page_count_timer.timeout.connect(self._count_pages)
+
     def _build_status_bar(self):
         # Bottom right: the generation bar; Export MP3 in its place at 100%, or the
         # fern Resume Generating once generation was stopped.
@@ -581,6 +617,10 @@ class MainWindow(QMainWindow):
             cx = min(stage.width() - self.cancel_button.width() - 12, center - self.cancel_button.width() // 2)
             self.cancel_button.move(cx, stage.height() - self.cancel_button.height() - 8)
             self.cancel_button.raise_()
+        info = self.reading_info
+        info.adjustSize()
+        info.move(16, stage.height() - info.height() - 14)
+        info.raise_()
 
     def _place_title(self):
         """Center the title on the toolbar; a title too long for that slides right
@@ -641,6 +681,7 @@ class MainWindow(QMainWindow):
     def _connect_view(self, view):
         view.clicked.connect(self._on_view_clicked)
         view.user_scrolled.connect(self._suspend_auto_follow)
+        view.verticalScrollBar().valueChanged.connect(lambda _v, v=view: self._on_view_moved(v))
         view.hide()
         return view
 
@@ -670,6 +711,8 @@ class MainWindow(QMainWindow):
             view = self._reflow()
             view.set_scale(self.settings.reflow_font_size)
         view.set_theme(self.theme)
+        view.set_style(self._reading_style())
+        view.set_page_mode(self.settings.page_view)
         shown = self._views.get(view)
         if shown is None or shown[0] is not book or shown[1] != mode:
             view.set_book(book, mode)
@@ -689,6 +732,8 @@ class MainWindow(QMainWindow):
         self._highlight = None
         self._follow_block = -1
         view.setFocus()
+        self._update_reading_info()
+        self._page_count_timer.start()
 
     # ---------- theme ----------
 
@@ -1863,7 +1908,10 @@ class MainWindow(QMainWindow):
         cue = cue_at(cues, ms) or (cues[0] if cues and not self.player.is_playing() else None)
         if cue is None:
             return  # no audio here yet, or not yet heard: keep what's shown
-        span = (block, cue.start_char, cue.end_char)
+        span = self._highlight_span(block, ms, cue)
+        if block != self._info_block:
+            self._info_block = block
+            self._update_reading_info()
         if span == self._highlight:
             return
         self._highlight = span
@@ -1874,6 +1922,17 @@ class MainWindow(QMainWindow):
                 self.view.scroll_to(block, cue.start_char)
             else:
                 self.view.keep_in_view(*span)
+
+    def _highlight_span(self, block: int, ms: int, cue: Cue) -> tuple[int, int, int]:
+        """What the highlighter covers (Settings ▸ Reading ▸ Highlighter): the word being
+        said, the sentence (a cue), or the whole paragraph."""
+        unit = self.settings.highlight_unit
+        if unit == "paragraph":
+            return block, 0, len(self.book.blocks[block].text)
+        if unit == "word" and cue.end_ms > cue.start_ms:
+            fraction = (ms - cue.start_ms) / (cue.end_ms - cue.start_ms)
+            return (block, *word_at(self.book.blocks[block].text, cue.start_char, cue.end_char, fraction))
+        return block, cue.start_char, cue.end_char
 
     def _center_on_position(self, *, animate: bool):
         """The sentence at the position, highlighted and centered (a resumed book, a new layout)."""
@@ -1948,17 +2007,24 @@ class MainWindow(QMainWindow):
         """"Aa": themes, text size, layout and the highlight, like Apple Books."""
         if self.book is None:
             return
-        popover = ThemesPopover(self, self.theme.key, layout=self._layout_mode(), highlight=self.settings.highlight)
+        popover = ThemesPopover(
+            self, self.theme.key, layout=self._layout_mode(), highlight=self.settings.highlight,
+            page_view=self.settings.page_view, highlight_unit=self.settings.highlight_unit,
+        )
         popover.theme_chosen.connect(self._apply_theme)
         popover.text_size_step.connect(self._step_text_size)
         popover.layout_chosen.connect(self._set_layout)
         popover.highlight_toggled.connect(self._on_highlight_toggled)
+        popover.page_view_chosen.connect(lambda mode: self._change_setting("page_view", mode))
+        popover.highlight_unit_chosen.connect(lambda unit: self._change_setting("highlight_unit", unit))
+        popover.settings_requested.connect(lambda: QTimer.singleShot(0, self, self.open_settings))
         self._themes_popover = popover
         popover.popup_under(self.themes_button)
 
     def _step_text_size(self, step: int):
         if self.view is None:
             return
+        self._page_count_timer.start()
         if self.view is self.page_view:
             zoom = round(min(MAX_ZOOM, max(MIN_ZOOM, self.settings.page_zoom + step * ZOOM_STEP)), 2)
             if zoom == self.settings.page_zoom:
@@ -1990,6 +2056,135 @@ class MainWindow(QMainWindow):
         self._setup_view()
         self._highlight = highlight
         self._center_on_position(animate=False)
+
+    # ---------- settings ----------
+
+    def open_settings(self):
+        """Settings… (⌘,): every change applies at once."""
+        dialogs.SettingsDialog.ask(self, self.settings, self._on_setting_changed, add_font=self._add_font)
+        self.settings.save()
+
+    def _add_font(self) -> list[str]:
+        path, _ = QFileDialog.getOpenFileName(self, "Add a Font", "", "Fonts (*.ttf *.otf *.ttc)")
+        if not path:
+            return []
+        try:
+            return fonts.add_font(path)
+        except (OSError, ValueError) as e:
+            inform(self, "This font couldn't be added.", str(e))
+            return []
+
+    def _change_setting(self, field: str, value):
+        setattr(self.settings, field, value)
+        self._on_setting_changed(field)
+
+    def _on_setting_changed(self, field: str):
+        """A setting changed (the Settings window, Aa, the library's ☰): apply it now."""
+        s = self.settings
+        if field in STYLE_FIELDS:
+            for view in (self.reflow_view, self.page_view):
+                if view is not None:
+                    view.set_style(self._reading_style())
+            self._after_relayout()
+        elif field == "page_view":
+            for view in (self.reflow_view, self.page_view):
+                if view is not None:
+                    view.set_page_mode(s.page_view)
+            self._after_relayout()
+        elif field == "reflow_font_size":
+            if self.reflow_view is not None:
+                self.reflow_view.set_scale(s.reflow_font_size)
+            self._after_relayout()
+        elif field == "theme":
+            self._apply_theme(s.theme)
+        elif field in ("custom_page", "custom_text"):
+            themes.set_custom_colors(s.custom_page, s.custom_text)
+            if self.theme.key == "custom":
+                self._restyle("custom")
+        elif field in ("auto_mode", "light_theme", "dark_theme"):
+            self._follow_appearance()
+        elif field in ("highlight", "highlight_unit"):
+            self._apply_highlight_setting()
+        elif field in ("show_page_numbers", "show_read_percent", "always_show_status_bar"):
+            self._page_count_timer.start()
+            self._update_reading_info()
+        s.save()
+
+    def _reading_style(self) -> ReadingStyle:
+        s = self.settings
+        return ReadingStyle(
+            family=s.font_family, weight=s.font_weight, line_spacing=s.line_spacing,
+            paragraph_spacing=s.paragraph_spacing, word_spacing=s.word_spacing, letter_spacing=s.letter_spacing,
+            justify=s.justify, margin_left=s.margin_left, margin_right=s.margin_right, max_column=s.max_column,
+        )
+
+    def _after_relayout(self):
+        """The text moved: the sentence being read back in view, the pages counted again."""
+        if self.view is not None and self._highlight is not None and self._auto_follow:
+            block, start, _ = self._highlight
+            QTimer.singleShot(0, self, lambda: self.view.scroll_to(block, start, animate=False) if self.view else None)
+        self._page_count_timer.start()
+        self._update_reading_info()
+
+    def _reading(self) -> bool:
+        return self.book is not None and self.pages.currentWidget() is self.reader_page
+
+    # ---------- page and progress ----------
+
+    def _on_view_moved(self, view):
+        if view is self.view:
+            self._update_reading_info()
+            self._poke_reading_info()
+
+    def _count_pages(self):
+        if self.view is self.reflow_view and self.view is not None and self.settings.show_page_numbers:
+            self.view.count_pages()
+        self._update_reading_info()
+
+    def reading_fraction(self) -> float:
+        """How much of the book lies before where the reader is: the audio's position while
+        following it, else the page on screen."""
+        if self.book is None or not self._before[-1]:
+            return 0.0
+        block = self.player.position()[0]
+        if self.view is not None and (not self._auto_follow or not (self.store and self.store.durations())):
+            block = self.view.current_block()
+        return self._before[min(max(block, 0), len(self._before) - 1)] / self._before[-1]
+
+    def reading_info_text(self) -> str:
+        """"Page 12 of 340 · 34%" ("Pages 3–4 of 120" on a double page)."""
+        if self.book is None or self.view is None:
+            return ""
+        parts = []
+        if self.settings.show_page_numbers:
+            info = self.view.page_info()
+            if info is not None:
+                first, last, total = info
+                parts.append(f"Pages {first}–{last} of {total}" if last > first else f"Page {first} of {total}")
+        if self.settings.show_read_percent:
+            parts.append(f"{int(self.reading_fraction() * 100)}%")
+        return "  ·  ".join(parts)
+
+    def _update_reading_info(self):
+        text = self.reading_info_text()
+        self.reading_info.setText(text)
+        if not text:
+            self.reading_info.hide()
+        elif self.settings.always_show_status_bar:
+            self.reading_info.show()
+        self._place_overlays()
+
+    def _poke_reading_info(self):
+        """The reader moved: show the page and progress for a moment."""
+        if self.reading_info.text():
+            self.reading_info.show()
+            self._place_overlays()
+            if not self.settings.always_show_status_bar:
+                self._info_timer.start()
+
+    def _fade_reading_info(self):
+        if not self.settings.always_show_status_bar:
+            self.reading_info.hide()
 
     def _on_highlight_toggled(self, on: bool):
         self.settings.highlight = on
