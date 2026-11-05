@@ -30,6 +30,7 @@ def quiet_libraries() -> None:
 
 def main() -> None:
     quiet_libraries()
+    from PySide6.QtCore import QEvent, QObject
     from PySide6.QtGui import QIcon
     from PySide6.QtWidgets import QApplication
 
@@ -44,8 +45,33 @@ def main() -> None:
     app.setStyle("Fusion")
     app.setFont(ui_font(13))  # SF Pro, the macOS system font (see ui/theme.py)
     app.setWindowIcon(QIcon(str(ICONS_DIR / "livrosound-1024.png")))  # the window and the Dock
+
+    class FileOpener(QObject):
+        """Books opened with LivroSound from Finder (or dropped on its Dock icon) arrive
+        as FileOpen events, the first ones before the window exists."""
+
+        def __init__(self):
+            super().__init__()
+            self.window = None
+            self.waiting = [a for a in sys.argv[1:] if not a.startswith("-")]  # `uv run main.py book.epub`
+
+        def eventFilter(self, watched, event):
+            if event.type() == QEvent.Type.FileOpen and event.file():
+                self.waiting.append(event.file())
+                self.deliver()
+                return True
+            return False
+
+        def deliver(self):
+            while self.window is not None and self.waiting:
+                self.window.open_external(self.waiting.pop(0))
+
+    opener = FileOpener()
+    app.installEventFilter(opener)
     window = MainWindow()
     window.show()
+    opener.window = window
+    opener.deliver()
     sys.exit(app.exec())
 
 

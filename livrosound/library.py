@@ -53,6 +53,49 @@ class Settings:
     validate_audio: bool = False
     voice: str = "Aaron"
 
+    # The library page (pic 2/3 of the user's Readest screenshots).
+    library_view: str = "grid"  # "grid" | "list"
+    library_columns: int = 0  # 0 = as many as fit
+    library_group: str = "none"  # see shelf.GROUPS
+    library_sort: str = "date_read"  # see shelf.SORTS
+    library_descending: bool = True
+    library_then: str = "title"  # the second sort key ("" = none)
+    library_then_descending: bool = False
+
+    # The app (Readest's ☰ menu).
+    open_last_book: bool = False  # skip the landing page and reopen the last book
+    auto_import: bool = True  # a book opened from Finder or dropped on the window is added at once
+    always_show_status_bar: bool = False  # else the reading info fades while reading
+    auto_mode: bool = False  # follow macOS Light/Dark: light_theme by day, dark_theme by night
+    light_theme: str = "original"
+    dark_theme: str = "dark"
+
+    # Reading (the Aa popover and Settings ▸ Font / Layout / Color).
+    font_family: str = ""  # "" = the reading serif (theme.READING_FAMILIES)
+    font_weight: int = 400  # CSS weight, 300..700
+    line_spacing: float = 1.5  # × the font size
+    paragraph_spacing: float = 0.3  # em below a paragraph
+    word_spacing: float = 0.0  # px added between words
+    letter_spacing: float = 0.0  # px added between letters
+    justify: bool = False
+    margin_left: int = -1  # px beside the text column; -1 = centered
+    margin_right: int = -1
+    max_column: int = 700  # px: the widest the text column gets
+    page_view: str = "scroll"  # "scroll" | "single" | "double"
+    show_page_numbers: bool = True
+    show_read_percent: bool = True
+    custom_page: str = "#F6F1E7"  # the Custom theme's paper and ink
+    custom_text: str = "#2B2621"
+
+    # Listening.
+    highlight_unit: str = "sentence"  # "word" | "sentence" | "paragraph"
+    read_aloud: bool = True  # False: LivroSound is an e-reader only (no audio at all)
+    export_format: str = "mp3"  # "mp3" | "m4b"
+    # Measured generation speed (spoken characters per second of wall time), so the
+    # time estimates get better with use; 0 = not measured yet.
+    rate_normal: float = 0.0
+    rate_generation_only: float = 0.0
+
     @classmethod
     def load(cls) -> "Settings":
         return _from_dict(cls, _read_json(paths.settings_path()))
@@ -90,6 +133,18 @@ class BookRecord:
     # Share of the book's spoken characters before the saved position (the library's
     # "34% read"), kept up to date as the position is saved; -1 = not known yet.
     read_fraction: float = -1.0
+    # The library page: from bookinfo.read_info (info_version 0 = not read yet),
+    # and the user's own tags and collections.
+    date_added: str = ""  # ISO timestamp ("" for books added before it was kept: last_opened)
+    subjects: list = field(default_factory=list)
+    series: str = ""
+    series_index: float = 0.0
+    published: str = ""
+    pages: int = 0
+    spoken_chars: int = 0  # characters read aloud in the whole book (for time remaining)
+    info_version: int = 0
+    tags: list = field(default_factory=list)
+    collections: list = field(default_factory=list)
 
     def audio_options(self) -> SpeechOptions | None:
         """speech_options as SpeechOptions (None when unset or unreadable)."""

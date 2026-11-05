@@ -33,14 +33,15 @@ def test_default_narrators():
     assert voice_named("alba") is None, "Pocket-TTS's own voices are never offered"
 
 
-def test_grouped_women_then_men_young_to_mature():
+def test_grouped_aaron_and_ana_first_then_women_then_men_young_to_mature():
     groups = dict(grouped())
-    assert [label for label, _ in grouped()] == ["Women", "Men"]
+    assert [label for label, _ in grouped()] == ["Recommended", "Women", "Men"]
+    assert [v.name for v in groups["Recommended"]] == ["Aaron", "Ana"]  # the user's rule: at the top
     assert [v.name for v in groups["Women"]] == [
-        "Emily", "Gigi", "Liz", "Ruth", "Ana", "Anne", "Susan", "Therese", "Gertrude",
+        "Emily", "Gigi", "Liz", "Ruth", "Anne", "Susan", "Therese", "Gertrude",
     ]
     assert [v.name for v in groups["Men"]] == [
-        "Danny", "Kyle", "Aaron", "Connor", "Ethan", "Johnny", "Matthew", "Ronald",
+        "Danny", "Kyle", "Connor", "Ethan", "Johnny", "Matthew", "Ronald",
     ]
 
 

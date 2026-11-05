@@ -2,8 +2,8 @@
 
 Minimal on purpose, like the welcome windows of Apple's apps: the open-book icon,
 the wordmark, one quiet line, and the only two things to do here — upload a new
-book (fern, the app's "go" color) or resume one from the library (outlined; off
-while the library is empty). A footnote says what files work and that nothing
+book (fern, the app's "go" color) or go to the library (outlined), where every
+book opened before waits at its cover. A footnote says what files work and that nothing
 leaves the Mac.
 
 The page paints its own background in the theme's panel color (white,
@@ -43,13 +43,13 @@ class LivroSoundLanding(QWidget):
     """The start page; the main window answers its two buttons."""
 
     upload_clicked = Signal()
-    resume_clicked = Signal()
+    library_clicked = Signal()
 
     BOOK_WIDTH = 236
     BUTTON_HEIGHT = 44  # the stylesheet rounds the buttons with half of this
     BUTTON_PADDING = 30  # each side, as in the stylesheet
 
-    def __init__(self, parent=None, *, resume_enabled: bool = False):
+    def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("landingPage")
 
@@ -68,21 +68,22 @@ class LivroSoundLanding(QWidget):
         self.upload_button = self._button("Upload New Book", "landingPrimary")
         self.upload_button.setToolTip("PDF, EPUB, Word or text file")
         self.upload_button.clicked.connect(lambda: self.upload_clicked.emit())
-        self.resume_button = self._button("Resume a Previous Book", "landingSecondary")
-        self.resume_button.clicked.connect(lambda: self.resume_clicked.emit())
+        self.library_button = self._button("Go to Library", "landingSecondary")
+        self.library_button.setToolTip("Your books, and where you left off in each")
+        self.library_button.clicked.connect(lambda: self.library_clicked.emit())
         # Both the width of the longer label, measured here rather than from sizeHint(),
         # which doesn't know the stylesheet's padding until the page is in the window.
         width = max(
             QFontMetrics(b.font()).horizontalAdvance(b.text()) + 2 * self.BUTTON_PADDING + 4
-            for b in (self.upload_button, self.resume_button)
+            for b in (self.upload_button, self.library_button)
         )
-        for button in (self.upload_button, self.resume_button):
+        for button in (self.upload_button, self.library_button):
             button.setFixedWidth(width)
         buttons = QHBoxLayout()
         buttons.setSpacing(14)
         buttons.addStretch(1)
         buttons.addWidget(self.upload_button)
-        buttons.addWidget(self.resume_button)
+        buttons.addWidget(self.library_button)
         buttons.addStretch(1)
 
         footnote = QLabel("PDF · EPUB · DOCX · TXT — everything stays on your Mac")
@@ -103,12 +104,6 @@ class LivroSoundLanding(QWidget):
         layout.addStretch(7)
         layout.addWidget(footnote, 0, Qt.AlignmentFlag.AlignHCenter)
 
-        self.set_resume_enabled(resume_enabled)
-
-    def set_resume_enabled(self, enabled: bool) -> None:
-        """Resume needs at least one book in the library."""
-        self.resume_button.setEnabled(enabled)
-        self.resume_button.setToolTip("Pick up where you left off" if enabled else "Books you open will be listed here")
 
     def _button(self, text: str, object_name: str) -> QPushButton:
         button = QPushButton(text)
