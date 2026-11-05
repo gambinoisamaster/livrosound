@@ -503,3 +503,22 @@ def test_custom_theme_colors(qapp):
     assert not light.dark and light.text == "#202020" and light.highlight != light.page
     themes.set_custom_colors("not a color", "#000000")
     assert themes.theme_for("custom") is light
+
+
+def test_chapter_export_dialog(host, monkeypatch):
+    rows = [("Chapter One", "12 min", True), ("Chapter Two", "15 min", False), ("Chapter Three", "9 min", False)]
+    dialog = d.ChapterExportDialog(host, rows, "mp3", "/music", eta=lambda indices: f"{len(indices)} to make",
+                                   choose_folder=lambda current: "/elsewhere")
+    assert not dialog.export_button.isEnabled() and dialog.chosen() == []
+    dialog.list.item(0).setCheckState(Qt.CheckState.Checked)
+    assert dialog.export_button.text() == "Export" and "ready to save" in dialog.summary.text()
+    dialog.list.item(1).setCheckState(Qt.CheckState.Checked)
+    assert dialog.export_button.text() == "Generate & Export" and "(1 to make)" in dialog.summary.text()
+    dialog.format_buttons["m4b"].click()
+    dialog._change_folder()
+    assert (dialog.chosen(), dialog.fmt, dialog.folder) == ([0, 1], "m4b", "/elsewhere")
+    dialog.all_button.click()
+    assert dialog.chosen() == [0, 1, 2]
+    _answer(monkeypatch, d.ChapterExportDialog, lambda dlg: (dlg.list.item(2).setCheckState(Qt.CheckState.Checked),
+                                                            dlg.export_button.click()))
+    assert d.ChapterExportDialog.ask(host, rows, "mp3", "/m") == ([2], "mp3", "/m")

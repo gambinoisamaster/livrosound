@@ -472,9 +472,8 @@ a small fern dot marks chapters whose audio is ready), PlayerCapsule (−10 sec,
 
 `ui/landing.py`: `LivroSoundLanding(QWidget)` — sleek, modern, minimalist: the open
 hardcover book icon (`assets/icons/livrosound.svg`), the wordmark **LivroSound**, a quiet
-tagline, and two buttons: **Upload New Book** (primary, fern) and **Resume a Previous
-Book** (secondary; disabled when the library is empty). Signals `upload_clicked`,
-`resume_clicked`; `set_resume_enabled(bool)`.
+tagline, and two buttons: **Upload New Book** (primary, fern) and **Go to Library**
+(secondary). Signals `upload_clicked`, `library_clicked`.
 
 `ui/dialogs.py`: `ImportProgressDialog`, `LayoutDialog` (two cards with live previews: **Keep
 Original Layout** / **LivroSound Layout**), `ChooseVoiceDialog` (window title
@@ -482,8 +481,9 @@ Original Layout** / **LivroSound Layout**), `ChooseVoiceDialog` (window title
 preview by Pocket-TTS; `ask(parent, engine, voice, …) -> voice | None`; Continue off with the
 install hint when the engine can't run), `CustomizeAudioDialog` (Highlight
 sentences, Read chapter titles, Read footnotes, Whisper check, Pause between paragraphs
-0.2–2.0 s; Go Back / Generate Audio), `LibraryDialog` ("Your Books": title, author,
-progress, last opened; Open; right-click Remove from Library with confirm).
+0.2–2.0 s; Go Back / Generate Audio), `BookDetailsDialog` (a book's facts; edits its tags and
+collections), `SettingsDialog`, `ChapterExportDialog` (see "Additions" below).
+**Removed (2026-11-05):** `LibraryDialog` (replaced by the library page).
 
 `ui/reader_view.py` (the shared interface), `ui/reflow_view.py`, `ui/page_view.py`:
 
@@ -552,8 +552,10 @@ calls `ensure_reading_fonts()`, sets the app name "LivroSound", Fusion style,
 ## User flows (binding)
 
 1. **Launch** → landing page. Resume is enabled when the library has books. Menu bar:
-   File (Upload New Book… ⌘O, Resume a Previous Book… ⇧⌘O), Help (About LivroSound,
-   Credits).
+   File (Upload New Book… ⌘O, Go to Library ⇧⌘L, Settings… ⌘,), Audio (Audio-Generation
+   Only… ⌥⌘G, Audio Player Only ⌥⌘P, Export MP3…, Export M4B Audiobook…, Export
+   Chapters…), Edit (Find… ⌘F, Find Next ⌘G, Find Previous ⇧⌘G), View (Larger / Smaller
+   Text ⌘+ / ⌘−), Help (About LivroSound, Credits).
 2. **Upload New Book** → file dialog (PDF with digital text, EPUB — also an unzipped
    .epub folder — DOCX, TXT). The file's fingerprint is taken off the UI thread; a book
    already in the library asks "You've opened this book before. Pick up where you left
@@ -593,7 +595,7 @@ calls `ensure_reading_fonts()`, sets the app name "LivroSound", Fusion style,
    Playback that runs into a block without audio waits ("Waiting for audio…") if the
    running generation makes it within `WAIT_AHEAD_CHARS` (2000) characters, otherwise
    pauses and asks the same question.
-9. **Resume a Previous Book** → `LibraryDialog` → the book opens at its saved position
+9. **Go to Library** → the library page → clicking a cover opens the book at its saved position
    (sentence highlighted and centered), audio ready where generated; if generation was
    unfinished: "Continue generating audio?" (continues from the first missing block at/after
    the position). No ding on resume. A PDF opened from a new folder is read from there;
@@ -632,3 +634,125 @@ Notes on how the modules turned out, where they go beyond the contract above.
 - ui/main_window.py (later): "No" to "Generate audio from the beginning?" shows an alert "Choose where to start" with the hint, and leaves it in the status bar; clicking the text of a book without a voice opens Choose a Voice → Customize Audio and generates from there; the highlight keeps the last sentence lit through a block's lead-in silence; a scanned PDF's import error is titled "Scanned books aren't supported yet."; unzipped EPUB folders open like files.
 - scripts: `smoke_test.py <book> [--engine fake|pocket] [--blocks N] [--voice NAME] [--out FILE]` (temp cache; MP3 → `cache/smoke_test.mp3`); `make_voice_previews.py [--engine Pocket-TTS]`.
 - **Removed (2026-10-23, user decisions; code kept in `~/livrosound-scanned-books-snapshot-2026-10-23.tar.gz`)**: scanned books — `ingest/ocr.py` (PaddleOCR PP-OCRv6: `PdfProbe`, `probe_pdf`, `ocr_available`, `text_quality`, `PaddlePageReader`, `OcrLine`, `SECONDS_PER_PAGE`), `ImportOptions` and `load_book`'s options argument, `import.json`, `book_dir/ocr/`, `ImportDialog`, `Book.text_source`, `BookRecord.scanned` / `ocr` / `ocr_quality`, the `ocr` extra; OmniVoice — `engines/omnivoice.py`, the engine choice in Choose a Voice, `Settings.engine`, the `omnivoice` extra.
+
+## Additions (2026-11-05, user requests)
+
+The user asked for Readest's settings and customizations, a library, and new audio
+modes ("add all the features in readest features.pdf"; the PDF shows Readest's ☰ menu).
+Decisions the user made when asked: Look Up uses the Mac's offline dictionary (New
+Oxford American) with Merriam-Webster and Oxford as web links (the only optional
+network use, on a click); audio-generation only mode is built even though it saves
+little CPU (the display costs little next to Pocket-TTS); single/double page applies to
+every layout; highlights get five colors, notes and a list; Export Chapters makes only
+the chosen chapters and saves each as soon as it's ready. Hyphenation (in Readest) is
+not done: Qt doesn't hyphenate and soft hyphens would break the char maps.
+
+### New modules
+
+```python
+# shelf.py — the library's ordering, grouping and search (pure)
+SORTS: dict[str, str]   # title author format pages series date_read date_added date_published progress time_remaining
+GROUPS: dict[str, str]  # none authors tags subjects collections series status
+def sort_records(records, key, descending=False, then="", then_descending=False) -> list[BookRecord]   # missing values last
+def group_records(records, group) -> list[tuple[str, list[BookRecord]]]   # a book can be in several groups
+def matches(record, query) -> bool; def seconds_remaining(record, rate=1.0) -> float | None
+def status(record) -> "Reading" | "Not Started" | "Finished"; def all_values(records, "tags"|"collections")
+
+# bookinfo.py — read straight from the source file (no PARSER_VERSION bump: audio is kept)
+INFO_VERSION = 1
+@dataclass class BookInfo: subjects, series, series_index, published, pages, cover (bytes)
+def read_info(path, kind, *, words=0) -> BookInfo     # EPUB OPF (dc:subject, dc:date, calibre:series,
+                                                      # belongs-to-collection, cover-image), PDF metadata
+                                                      # + first page as the cover, DOCX core properties
+def save_cover(book_id, data) -> Path | None          # book_dir/cover.jpg, 600 px high
+def cover_path(book_id) -> Path
+
+# search.py — Find in the book
+class FoldedBook: find(query, limit=MAX_MATCHES) -> list[Match(block, start, end)]   # case/accent/quote-insensitive
+def nearest(matches, block) -> int
+
+# annotations.py — the reader's highlights and notes, book_dir/annotations.json
+COLORS = {yellow, green, blue, pink, purple}
+@dataclass class Annotation: start_block, start_char, end_block, end_char, text, color, note, created, id
+class Annotations(book_id): all() add(book, start, end, color, note) get(id) update(id, color=, note=) remove(id) at(block, char)
+
+# dictionary.py — DictionaryServices (DCSCopyTextDefinition) via ctypes on macOS
+def define(word) -> str | None; dictionary_app_url / merriam_webster_url / oxford_url(word) -> str
+
+# estimate.py — generation time: RateMeter (first block left out), rates(saved_normal, saved_only,
+#   live, live_is_generation_only) -> (normal, only) chars/s, DEFAULT_RATE 60, GENERATION_ONLY_GAIN 1.08,
+#   blend(), duration_text()
+# power.py — KeepAwake: NSProcessInfo beginActivityWithOptions (no App Nap / idle sleep) while generating
+# ui/fonts.py — add_font(path) copies into paths.fonts_dir() and registers; load_user_fonts(); families()
+# ui/library_page.py — LibraryPage(library, settings): BookShelf (painted grid/list, sections, Select),
+#   view_menu() / app_menu() / context_menu(id); signals open_requested, upload_requested,
+#   home_requested, back_to_book_requested, remove_requested(list), details_requested, reveal_requested,
+#   settings_requested, about_requested, option_toggled(field, on), changed
+# ui/audio_pages.py — GenerationPage (audio-generation only), PlayerPage (audio player only), ChapterBar
+```
+
+Extended APIs:
+- `Settings`: library_view/columns/group/sort/descending/then/then_descending; open_last_book,
+  auto_import, always_show_status_bar, auto_mode, light_theme, dark_theme; font_family,
+  font_weight, line_spacing, paragraph_spacing, word_spacing, letter_spacing, justify,
+  margin_left/right (-1 = centered), max_column, page_view ("scroll"|"single"|"double"),
+  show_page_numbers, show_read_percent, custom_page/custom_text; highlight_unit
+  ("word"|"sentence"|"paragraph"), read_aloud, export_format ("mp3"|"m4b"), rate_normal,
+  rate_generation_only.
+- `BookRecord`: date_added, subjects, series, series_index, published, pages, spoken_chars,
+  info_version, tags, collections.
+- `ReaderView`: `set_page_mode(mode)`, `set_style(ReadingStyle)`, `page_info() -> (first, last,
+  total) | None`, `spread_step()`, `page_step(±1)`, `turn_to(value)`, `set_marks([(block, start,
+  end, color)])`, `selected_range()`, `clear_selection()`; signals `selection_made(QPoint)`,
+  `context_requested(block, char, QPoint)`. `ReflowView.count_pages()` lays the book out to count.
+- `Generator.run_blocks(blocks, ...)`; `GenerationWorker(generator, start, blocks=None)`.
+- `export.export_audio(book, store, order, path, *, fmt, bitrate, cover, progress, cancelled)`
+  (MP3, or M4B = AAC in MP4 via ffmpeg's ipod muxer: QuickTime + Nero chapters, cover as attached
+  art); `export_chapter(book, store, blocks, path, *, title, track, fmt, cover, ...)`;
+  `chapter_blocks(book, order)` (top-level chapters, the opening goes with the first);
+  `chapter_file_name(n, title, fmt)`. `export_mp3` is kept.
+- `voices.grouped()` starts with ("Recommended", [Aaron, Ana]) (user: "Aaron and Ana must be at
+  top of the list").
+- `theme.custom_theme(page, text)`, `set_custom_colors()`, `theme_for("custom")`,
+  `selection_color(theme)` (mouse selection is never the reading highlight's color),
+  `reading_font(size, weight, family)`.
+
+### New flows (binding)
+
+13. **Library page** (Go to Library, ⇧⌘L, the toolbar's Library): covers (grid) or rows (list),
+    search, Columns Auto/±, Group by, Sort by + Then by, each Ascending/Descending (all kept in
+    Settings). Select → Open / Collection / Tag / Details / Remove; right-click a cover for the
+    same plus Show in Finder. Book info and covers missing from older records are read in the
+    background while the page is open. The open book stays open (Back to Book); Remove asks and
+    closes it first.
+14. **☰ options**: Open Last Book on Start; Auto Import on File Open (Finder FileOpen events and
+    drag-and-drop import at once, else "Add “x” to your library?"); Always Show Status Bar (the
+    "Page 12 of 340 · 34%" line under the book; else it fades after 3 s); Auto Mode (light_theme
+    in macOS Light, dark_theme in Dark; choosing a theme sets the one for the current appearance).
+15. **Settings** (⌘, or Aa ▸ More Settings…): Font, Layout, Color, Reading, General, Shortcuts;
+    changes apply live. Page view continuous / single / double for every layout (paged: Qt's
+    pagination, no line cut by a page edge; double page paints two pages; PDF: whole pages
+    fitted). Highlighter word (estimated within each cue by syllables) / sentence / paragraph.
+16. **Select text** (drag or double-click; a click waits doubleClickInterval so a double click
+    never starts playback): Highlight (5 colors), Add Note…, Copy, Look Up, Find in Book.
+    Right-click a highlight: Color, Edit Note…, Copy, Remove; right-click text: Look Up, Read
+    Aloud from Here. Notes (toolbar) lists them; click jumps.
+17. **Find** ⌘F: matches in reading order from the page on screen; the current one marked orange.
+18. **Read books aloud off** (Settings ▸ Reading): an e-reader — no player, no voice or audio
+    questions, clicks only follow contents links, ←/→/Space turn pages; the saved position is the
+    page on screen (also whenever a book has no audio yet).
+19. **Export**: Export MP3 / Export M4B (the status-bar button follows the last format; More…
+    opens the Audio menu); **Export Chapters…** picks chapters, makes only the missing blocks of
+    those (`run_blocks`) and saves each as "NN - Title.ext" in the chosen folder as soon as it's
+    complete, one export at a time.
+20. **Audio-generation only** (⌥⌘G): the generation page (cover, progress, time left, "When it's
+    done, save: Nothing / MP3 / M4B / Chapters" into ~/Music without asking); the views draw
+    nothing and the PDF render thread stops; Back to Reading returns (generation continues).
+21. **Time estimates**: beside the progress bar, "About X left · about Y in audio-generation
+    only mode", from the rate measured in this run (else the Mac's saved average for that mode,
+    else 60 chars/s); each run's rate is blended into Settings when it ends.
+22. **Audio player only** (⌥⌘P, toolbar Player): the player page — cover, chapter title, "7h 15m
+    left in book", a bar across the chapter (drag to move; un-made audio asks to make it), the
+    whole book as chapter segments (click to go), speed, Chapters, the player capsule, Show Text.
+23. While any generation runs, KeepAwake holds off App Nap and idle sleep.
+

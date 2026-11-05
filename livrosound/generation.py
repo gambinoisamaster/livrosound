@@ -137,9 +137,18 @@ class Generator:
             cancelled: Callable[[], bool] = _never) -> list[Issue]:
         """Make every missing block, starting at start_block and wrapping around (queue_from).
         on_block(block, duration_ms) follows each store.put. Returns the Whisper issues."""
+        return self.run_blocks(self.queue_from(start_block), on_block=on_block, on_status=on_status,
+                               cancelled=cancelled)
+
+    def run_blocks(self, blocks: list[int], *,
+                   on_block: Callable[[int, int], None] = lambda block, duration_ms: None,
+                   on_status: Callable[[str], None] = lambda message: None,
+                   cancelled: Callable[[], bool] = _never) -> list[Issue]:
+        """Make just these blocks (those still missing), in the order given: the chapters
+        the user picked to generate and export."""
         position = {block: k for k, block in enumerate(self._order, 1)}
         issues: list[Issue] = []
-        for block in self.queue_from(start_block):
+        for block in [b for b in blocks if b in self._weights]:
             if cancelled():
                 raise GenerationCancelled()
             if self.store.has(block):

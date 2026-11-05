@@ -165,3 +165,47 @@ def test_an_ffmpeg_failure_is_reported_and_leaves_nothing(store, tmp_path):
     with pytest.raises(RuntimeError, match="ffmpeg"):
         export_mp3(make_book(), store, ORDER, path, bitrate="not-a-bitrate")
     assert list(tmp_path.glob("book.mp3*")) == []
+
+
+def _jpeg(path: Path) -> Path:
+    from PySide6.QtGui import QColor, QImage
+
+    image = QImage(60, 90, QImage.Format.Format_RGB32)
+    image.fill(QColor("#335577"))
+    image.save(str(path), "JPG")
+    return path
+
+
+def test_m4b_audiobook_with_chapters_and_cover(store, tmp_path, qapp):
+    from livrosound.export import export_audio
+
+    path = tmp_path / "book.m4b"
+    export_audio(make_book(), store, ORDER, path, fmt="m4b", cover=_jpeg(tmp_path / "c.jpg"))
+    info = probe(path)
+    assert [c["tags"]["title"] for c in info["chapters"]] == ["The Harbour", "Part One", "A Pause"]
+    assert float(info["format"]["duration"]) == pytest.approx(sum(DURATIONS.values()) / 1000, abs=0.15)
+    assert info["format"]["tags"]["title"] == "The Harbour" and info["format"]["tags"]["artist"] == "Ann Author"
+    streams = json.loads(subprocess.run([_ffprobe(), "-v", "error", "-show_streams", "-of", "json", str(path)],
+                                        capture_output=True, text=True, check=True).stdout)["streams"]
+    assert {"aac", "mjpeg"} <= {s["codec_name"] for s in streams}  # (+ the QuickTime chapter track)
+    assert not path.with_name(path.name + ".partial").exists()
+
+
+def test_chapter_files(store, tmp_path):
+    from livrosound.export import chapter_blocks, chapter_file_name, export_chapter
+
+    book = make_book()
+    chapters = chapter_blocks(book, ORDER)
+    assert [(i, t, b) for i, t, b in chapters] == [(0, "The Harbour", [1, 2]), (1, "Part One", [4]),
+                                                    (2, "A Pause", [5, 6])]
+    assert chapter_blocks(make_book(toc=[]), ORDER) == [(-1, "The Harbour", ORDER)]
+    name = chapter_file_name(2, "Part One: The Sea/Shore", "m4b")
+    assert name == "02 - Part One - The Sea-Shore.m4b"
+    path = tmp_path / chapter_file_name(3, "A Pause", "mp3")
+    export_chapter(book, store, [5, 6], path, title="A Pause", track=(3, 3))
+    info = probe(path)
+    assert float(info["format"]["duration"]) == pytest.approx(4.3, abs=0.12)
+    assert info["format"]["tags"]["track"] == "3/3" and info["format"]["tags"]["album"] == "The Harbour"
+    assert info["chapters"] == []
+    with pytest.raises(ValueError):
+        export_chapter(book, store, [3], tmp_path / "x.mp3", title="x", track=(1, 1))

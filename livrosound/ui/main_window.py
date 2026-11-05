@@ -86,7 +86,8 @@ from PySide6.QtWidgets import (
 )
 from shiboken6 import isValid
 
-from .. import bookinfo, dictionary, export, paths, shelf
+from .. import bookinfo, dictionary, estimate, export, paths, shelf
+from ..power import KeepAwake
 from ..annotations import COLORS, Annotations
 from ..search import FoldedBook, Match, nearest
 from ..audio_store import AudioStore, Cue, cue_at
@@ -101,6 +102,7 @@ from ..timeline import Timeline
 from ..validate import Transcriber
 from . import dialogs, fonts
 from . import theme as themes
+from .audio_pages import GenerationPage, PlayerPage
 from .landing import LivroSoundLanding
 from .library_page import LibraryPage
 from .page_view import MAX_ZOOM, MIN_ZOOM, PageView
@@ -257,16 +259,20 @@ class GenerationWorker(QThread):
     failed = Signal(str)
     cancelled = Signal()
 
-    def __init__(self, generator: Generator, start_block: int):
+    def __init__(self, generator: Generator, start_block: int, blocks: list[int] | None = None):
         super().__init__()
         self.generator = generator
         self.start_block = start_block
+        self.blocks = blocks  # just these (chosen chapters), else from start_block on, wrapping
         self._cancel = threading.Event()
         order = generator.order()
         made = generator.store.generated()
         # What this run makes before wrapping around to the book's beginning: the
         # only blocks playback may wait for.
-        self.ahead = [b for b in order[bisect.bisect_left(order, start_block):] if b not in made]
+        if blocks is not None:
+            self.ahead = [b for b in blocks if b not in made]
+        else:
+            self.ahead = [b for b in order[bisect.bisect_left(order, start_block):] if b not in made]
         self._ahead_index = {block: i for i, block in enumerate(self.ahead)}
         self._next = 0  # the first entry of `ahead` that may still be missing
 
@@ -295,12 +301,18 @@ class GenerationWorker(QThread):
 
     def run(self):
         try:
-            issues = self.generator.run(
-                self.start_block,
-                on_block=self.block_done.emit,
-                on_status=self.status.emit,
-                cancelled=self._cancel.is_set,
-            )
+            if self.blocks is not None:
+                issues = self.generator.run_blocks(
+                    self.blocks, on_block=self.block_done.emit, on_status=self.status.emit,
+                    cancelled=self._cancel.is_set,
+                )
+            else:
+                issues = self.generator.run(
+                    self.start_block,
+                    on_block=self.block_done.emit,
+                    on_status=self.status.emit,
+                    cancelled=self._cancel.is_set,
+                )
         except GenerationCancelled:
             self.cancelled.emit()
         except Exception as e:  # shown to the user, never lost in a thread
@@ -370,6 +382,14 @@ class MainWindow(QMainWindow):
         # Generation.
         self._worker: GenerationWorker | None = None
         self._pending_start: int | None = None  # the block to start from once the running worker stops
+        self._pending_blocks: list[int] | None = None  # or just these blocks (chosen chapters)
+        self._meter: estimate.RateMeter | None = None  # how fast the running worker goes
+        self._keep_awake = KeepAwake("Generating audio for an audiobook")
+        self._generation_only = False  # audio-generation only mode: no text, no streaming
+        self._after_generation = "nothing"  # what generation-only mode saves at 100% (audio_pages.AFTER_CHOICES)
+        # Chapters chosen in Export Chapters: (number, title, blocks), saved (in order) as each is ready.
+        self._chapter_jobs: list[tuple[int, str, list[int]]] = []
+        self._chapter_target: tuple[str, Path, int] | None = None  # (format, folder, chapters in the book)
         self._retiring: list[GenerationWorker] = []  # workers of a closed book, still stopping
         self._released: list[tuple[str, Callable[[], None]]] = []  # (book id, then) once its workers stop
         self._pending_open: str | None = None  # a book waiting for its old worker to stop before it opens
@@ -447,10 +467,13 @@ class MainWindow(QMainWindow):
         self.landing.library_clicked.connect(self.show_library)
         self._info_task: Task | None = None  # reading the library's covers and book info
         self._build_library_page()
+        self._build_audio_pages()
         self.pages = QStackedWidget()
         self.pages.addWidget(self.landing)
         self.pages.addWidget(self.library_page)
         self.pages.addWidget(self.reader_page)
+        self.pages.addWidget(self.generation_page)
+        self.pages.addWidget(self.player_page)
         self.setCentralWidget(self.pages)
         self.setAcceptDrops(True)  # a book dropped on the window opens (Auto Import on File Open)
         QGuiApplication.styleHints().colorSchemeChanged.connect(lambda _scheme: self._follow_appearance())
@@ -481,6 +504,24 @@ class MainWindow(QMainWindow):
         self.settings_action.setMenuRole(QAction.MenuRole.PreferencesRole)
         self.settings_action.triggered.connect(self.open_settings)
         file_menu.addAction(self.settings_action)
+        audio_menu = self.menuBar().addMenu("Audio")
+        self.generation_only_action = QAction("Audio-Generation Only…", self)
+        self.generation_only_action.setShortcut(QKeySequence("Ctrl+Alt+G"))
+        self.generation_only_action.setToolTip("Make the audio with nothing else on screen")
+        self.generation_only_action.triggered.connect(self.enter_generation_only)
+        self.player_only_action = QAction("Audio Player Only", self)
+        self.player_only_action.setShortcut(QKeySequence("Ctrl+Alt+P"))
+        self.player_only_action.triggered.connect(self.enter_player_only)
+        audio_menu.addAction(self.generation_only_action)
+        audio_menu.addAction(self.player_only_action)
+        audio_menu.addSeparator()
+        self.export_actions = {}
+        for key, text in (("mp3", "Export MP3…"), ("m4b", "Export M4B Audiobook…"), ("chapters", "Export Chapters…")):
+            action = QAction(text, self)
+            action.triggered.connect(lambda _=False, k=key: self.export_chapters() if k == "chapters" else self.export(k))
+            audio_menu.addAction(action)
+            self.export_actions[key] = action
+        self.audio_menu = audio_menu
         edit_menu = self.menuBar().addMenu("Edit")
         for text, keys, slot in (
             ("Find…", QKeySequence.StandardKey.Find, self.open_find),
@@ -550,6 +591,8 @@ class MainWindow(QMainWindow):
         self.notes_button = pill("Notes", "Your highlights and notes in this book", self._open_notes, QSize(16, 16))
         self.themes_button = pill("", "Themes, text size, layout and highlight", self._open_themes, QSize(36, 24))
         self.regenerate_action = action("Re-Generate Audio", self.regenerate)
+        self.player_button = pill("Player", "Audio player only: the cover and the chapters, no text",
+                                  self.enter_player_only, QSize(16, 16))
 
         # The title, centered on the window rather than in the room the buttons leave (_place_title).
         self.title_label = QLabel(tb)
@@ -634,17 +677,30 @@ class MainWindow(QMainWindow):
         self.progress.setRange(0, 1000)
         self.progress.setTextVisible(True)
         self.progress.hide()
+        self.eta_label = QLabel()
+        self.eta_label.setObjectName("etaLabel")
+        self.eta_label.setFont(ui_font(11))
+        self.eta_label.hide()
+        sb.addPermanentWidget(self.eta_label)
         self.export_button = QPushButton("Export MP3")
         self.export_button.setObjectName("exportButton")
-        self.export_button.setToolTip("Save the whole book as one MP3, with chapters")
+        self.export_button.setToolTip("Save the whole book as one file, with chapters")
+        self.export_more = QPushButton("More…")
+        self.export_more.setObjectName("exportButton")
+        self.export_more.setToolTip("Export as MP3, as an M4B audiobook, or chapter by chapter")
+        self.export_more.clicked.connect(
+            lambda: self.audio_menu.exec(self.export_more.mapToGlobal(QPoint(0, -self.audio_menu.sizeHint().height())))
+        )
         self.resume_button = QPushButton("Resume Generating")
         self.resume_button.setObjectName("resumeButton")
         self.resume_button.setToolTip("Make the rest of the audio, from where you are")
-        for button, slot in ((self.export_button, self.export), (self.resume_button, self.resume_generation)):
+        for button, slot in ((self.export_button, lambda: self.export()), (self.export_more, None),
+                             (self.resume_button, self.resume_generation)):
             button.setFixedHeight(22)  # the stylesheet rounds them with half of this
             button.setCursor(Qt.CursorShape.PointingHandCursor)
             button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-            button.clicked.connect(slot)
+            if slot is not None:
+                button.clicked.connect(slot)
             button.hide()
             sb.addPermanentWidget(button)
         sb.addPermanentWidget(self.progress)
@@ -687,7 +743,7 @@ class MainWindow(QMainWindow):
         (as far as the window's edge) before it's shortened with "…", and never runs
         into the buttons on the left."""
         tb, label = self.toolbar, self.title_label
-        last = tb.widgetForAction(self.regenerate_action)
+        last = self.player_button if self.player_button.isVisible() else tb.widgetForAction(self.regenerate_action)
         left_edge = (last.geometry().right() if last is not None else 0) + 24
         right_edge = tb.width() - 20
         room = max(0, right_edge - left_edge)
@@ -722,6 +778,9 @@ class MainWindow(QMainWindow):
         self._set_title("")
 
     def _show_reader(self):
+        if self._generation_only:
+            self._generation_only = False
+            self._keep_rate_partial()
         self.pages.setCurrentWidget(self.reader_page)
         self.toolbar.show()
         self.statusBar().show()
@@ -1056,6 +1115,7 @@ class MainWindow(QMainWindow):
     def show_library(self):
         """Go to Library (flow 9): every book as a cover, the open book still open (unless
         it was removed from the library meanwhile: then it closes and stays gone)."""
+        self._generation_only = False
         if self.book is not None and self.library.get(self.book.book_id) is None:
             self._close_book(save=False)
         self.library_page.set_book_open(self.book.title if self.book is not None else "")
@@ -1382,6 +1442,8 @@ class MainWindow(QMainWindow):
         store = self.store
         self.book = self.record = self.store = self.generator = self.timeline = None
         self.annotations, self._folded, self._matches, self._match = None, None, [], -1
+        self._chapter_jobs, self._chapter_target, self._player_chapters = [], None, []
+        self._generation_only = False
         self._click_timer.stop()
         self._pending_click = None
         self.find_bar.hide()
@@ -1594,10 +1656,12 @@ class MainWindow(QMainWindow):
         self._refresh_transport()
         self._show_generation_state()
 
-    def _launch(self, start: int):
+    def _launch(self, start: int, blocks: list[int] | None = None):
         if self._closing:
             return  # Quit: nothing new starts
-        worker = GenerationWorker(self.generator, start)
+        worker = GenerationWorker(self.generator, start, blocks)
+        self._meter = estimate.RateMeter()
+        self._keep_awake.hold()  # no App Nap or idle sleep while audio is made
         # Each slot is told which worker spoke: a stopping one may still finish a block.
         worker.block_done.connect(lambda block, ms: self._on_block_done(worker, block, ms))
         worker.status.connect(lambda message: self._on_generation_status(worker, message))
@@ -1619,7 +1683,12 @@ class MainWindow(QMainWindow):
         self.player.block_generated(block)
         self._cues.pop(block, None)
         fraction = self.generator.fraction_done()
+        if self._meter is not None and worker is self._worker:
+            self._meter.block_done(self.weights.get(block, 1))
         self._set_progress(fraction)
+        self._show_eta()
+        self._save_ready_chapters()
+        self._refresh_audio_pages()
         if self._pending_char is not None and self._pending_char[0] == block:
             _, char = self._pending_char
             self._pending_char = None
@@ -1705,14 +1774,21 @@ class MainWindow(QMainWindow):
             self._released_now(worker.generator.book.book_id)
         elif worker is self._worker:
             self._worker = None
+            self._keep_rate()
             if self._pending_start is not None and not self._closing:
                 start, self._pending_start = self._pending_start, None
-                self._launch(start)
+                blocks, self._pending_blocks = self._pending_blocks, None
+                self._launch(start, blocks)
             else:
+                self._keep_awake.release()
                 if self._gate is not None:
                     self._gate = None  # nothing more is coming: Play follows the audio there is
                 self._refresh_transport()
                 self._show_generation_state()
+                self._refresh_audio_pages()
+                self._after_generation_only()
+        if self._worker is None and not self._retiring:
+            self._keep_awake.release()
         worker.deleteLater()
 
     def _run_released(self, book_id: str, steps: list[Callable[[], None]]):
@@ -1766,6 +1842,17 @@ class MainWindow(QMainWindow):
         self.cancel_button.setVisible(running and not exporting and audio)
         self.cancel_button.setEnabled(True)
         self.export_button.setVisible(done and not running and not exporting and audio)
+        self.export_button.setText("Export M4B" if self.settings.export_format == "m4b" else "Export MP3")
+        self.export_more.setVisible(self.export_button.isVisible())
+        for action in self.export_actions.values():
+            action.setEnabled(has_book and audio and not exporting)
+        for key in ("mp3", "m4b"):
+            self.export_actions[key].setEnabled(has_book and audio and done and not exporting)
+        self.generation_only_action.setEnabled(has_book and audio and bool(self.order) and not done)
+        self.player_only_action.setEnabled(has_book and audio)
+        self.player_button.setVisible(audio)
+        self.player_button.setEnabled(has_book)
+        self._show_eta()
         self.resume_button.setVisible(
             audio and has_book and not running and not done and started and bool(self.order)
         )
@@ -1941,6 +2028,7 @@ class MainWindow(QMainWindow):
 
     def _on_playing_changed(self, playing: bool):
         self.capsule.set_playing(playing)
+        self.player_page.capsule.set_playing(playing)
         if playing:
             self._position_timer.start()
         else:
@@ -2017,6 +2105,9 @@ class MainWindow(QMainWindow):
         """Highlight the sentence being heard and keep it in view (flow 7)."""
         if self.book is None:
             return
+        if self.pages.currentWidget() is self.player_page and time.monotonic() - self._player_refreshed > 0.25:
+            self._player_refreshed = time.monotonic()
+            self._refresh_audio_pages()
         if block != self._position_block:
             self._position_block = block
             self._refresh_transport()
@@ -2518,6 +2609,8 @@ class MainWindow(QMainWindow):
     def _update_reading_info(self):
         text = self.reading_info_text()
         self.reading_info.setText(text)
+        if self.pages.currentWidget() is self.player_page:
+            self._refresh_audio_pages()
         if not text:
             self.reading_info.hide()
         elif self.settings.always_show_status_bar:
@@ -2602,37 +2695,47 @@ class MainWindow(QMainWindow):
 
     # ---------- export ----------
 
-    def export(self):
-        """Export MP3 (at 100%): one file with chapters, made off the UI thread."""
+    def export(self, fmt: str | None = None, path: str | None = None):
+        """Export MP3 or M4B (at 100%): one file with chapters and the cover, made off the UI thread."""
         if self.book is None or self._export is not None or self._generating():
             return
-        default = Path.home() / "Music" / f"{_file_name(self.book.title)}.mp3"
-        path, _ = QFileDialog.getSaveFileName(self, "Export MP3", str(default), "MP3 audio (*.mp3)")
-        if not path:
-            return
-        if not path.lower().endswith(".mp3"):
-            path += ".mp3"
+        fmt = fmt or self.settings.export_format
+        if fmt != self.settings.export_format:
+            self.settings.export_format = fmt
+            self.settings.save()
+        if path is None:
+            default = Path.home() / "Music" / f"{_file_name(self.book.title)}.{fmt}"
+            kinds = "M4B audiobook (*.m4b)" if fmt == "m4b" else "MP3 audio (*.mp3)"
+            path, _ = QFileDialog.getSaveFileName(self, f"Export {fmt.upper()}", str(default), kinds)
+            if not path:
+                return
+        if not path.lower().endswith("." + fmt):
+            path += "." + fmt
         book, store, order = self.book, self.store, list(self.order)
+        cover = bookinfo.cover_path(book.book_id)
 
         def job(report, cancelled):
-            export.export_mp3(
-                book, store, order, Path(path),
+            export.export_audio(
+                book, store, order, Path(path), fmt=fmt, cover=cover if cover.is_file() else None,
                 progress=lambda f: report(round(f * 1000), 1000, ""), cancelled=cancelled,
             )
             return path
 
-        task = Task(job)
-        # The store stays open until the export ends, whatever book is open meanwhile.
+        self._run_export(Task(job), book, store, Path(path).name)
+
+    def _run_export(self, task: Task, book: Book, store: AudioStore, name: str,
+                    on_done: Callable[[str], None] | None = None):
+        """Run an export task; the store stays open until it ends, whatever book is open meanwhile."""
         self._export, self._export_store, self._export_book = task, store, book.book_id
         self._threads.add(task)
         task.progressed.connect(lambda done, total, _m: self._show_export_progress(done / max(1, total)))
-        task.done.connect(self._on_exported)
-        task.failed.connect(lambda message: inform(self, "The MP3 couldn't be saved.", message))
+        task.done.connect(on_done or self._on_exported)
+        task.failed.connect(lambda message: inform(self, f"“{name}” couldn't be saved.", message))
         task.cancelled.connect(lambda: self.statusBar().showMessage("Export cancelled.", 4000))
         task.finished.connect(lambda: self._on_export_finished(task))
         self._show_export_progress(0.0)
         self._show_generation_state()
-        self.statusBar().showMessage(f"Exporting “{Path(path).name}”…")
+        self.statusBar().showMessage(f"Exporting “{name}”…")
         task.start()
 
     def _show_export_progress(self, fraction: float):
@@ -2651,6 +2754,303 @@ class MainWindow(QMainWindow):
             self._release_store(store)  # the book may have been closed meanwhile
             self._released_now(self._export_book)
         self._show_generation_state()
+        if not self._closing:
+            self._save_ready_chapters()  # the next chapter waiting to be saved
+
+    # ---------- export chapter by chapter ----------
+
+    def export_chapters(self):
+        """Export Chapters…: pick chapters; those without audio are made first (only them),
+        and each is saved as its own file as soon as it's ready."""
+        if self.book is None or not self.order or not self.settings.read_aloud:
+            return
+        book = self.book
+        chapters = export.chapter_blocks(book, self.order)
+        made = self.store.generated()
+        durations = self.store.durations()
+        rows = []
+        for _, title, blocks in chapters:
+            ms = sum(durations.get(b, self.weights.get(b, 1) / estimate.NARRATION_CHARS_PER_S * 1000) for b in blocks)
+            rows.append((title, estimate.duration_text(ms / 1000), all(b in made for b in blocks)))
+
+        def eta(indices: list[int]) -> str:
+            chars = sum(self.weights.get(b, 1) for i in indices for b in chapters[i][2] if b not in made)
+            normal, _ = self._rates()
+            return f"about {estimate.duration_text(chars / normal)}"
+
+        folder = str(Path.home() / "Music" / _file_name(book.title))
+        answer = dialogs.ChapterExportDialog.ask(self, rows, self.settings.export_format, folder, eta=eta)
+        if answer is None or not self._still(book):
+            return
+        chosen, fmt, folder = answer
+        self.settings.export_format = fmt
+        self.settings.save()
+        self._chapter_jobs = [(i + 1, chapters[i][1], chapters[i][2]) for i in chosen]
+        self._chapter_target = (fmt, Path(folder), len(chapters))
+        missing = [b for _, _, blocks in self._chapter_jobs for b in blocks if b not in made]
+        if missing:
+            if not self._engine_ready():
+                if not self._choose_voice() or not self._still(book) or not self._use_chosen_voice(replace=False):
+                    self._chapter_jobs, self._chapter_target = [], None
+                    return
+                missing = [b for _, _, blocks in self._chapter_jobs for b in blocks if not self.store.has(b)]
+            self._start_generation_blocks(missing)
+        self._save_ready_chapters()
+
+    def _start_generation_blocks(self, blocks: list[int]):
+        """Make just these blocks (the chapters chosen to export), in order."""
+        if not blocks:
+            return
+        self._pick_mode = False
+        self.record.generation_start = blocks[0]
+        self.record.speech_options = dataclasses.asdict(self.generator.options)
+        self._save_record()
+        if self._worker is not None:
+            self._pending_start, self._pending_blocks = blocks[0], list(blocks)
+            self._worker.cancel()
+        else:
+            self._launch(blocks[0], list(blocks))
+        self.statusBar().showMessage(f"Making the audio of {len(self._chapter_jobs)} chapter(s)…")
+        self._show_generation_state()
+
+    def _save_ready_chapters(self):
+        """Save the next chosen chapter whose audio is all made (one export at a time)."""
+        if not self._chapter_jobs or self._chapter_target is None or self._export is not None or self.book is None:
+            return
+        ready = next((job for job in self._chapter_jobs if all(self.store.has(b) for b in job[2])), None)
+        if ready is None:
+            return
+        self._chapter_jobs.remove(ready)
+        number, title, blocks = ready
+        fmt, folder, count = self._chapter_target
+        book, store = self.book, self.store
+        cover = bookinfo.cover_path(book.book_id)
+        path = folder / export.chapter_file_name(number, title, fmt)
+        left = len(self._chapter_jobs)
+
+        def job(report, cancelled):
+            folder.mkdir(parents=True, exist_ok=True)
+            export.export_chapter(
+                book, store, blocks, path, title=title, track=(number, count), fmt=fmt,
+                cover=cover if cover.is_file() else None,
+                progress=lambda f: report(round(f * 1000), 1000, ""), cancelled=cancelled,
+            )
+            return str(path)
+
+        def saved(result: str):
+            more = f" — {left} more to go" if left else ""
+            self.statusBar().showMessage(f"Saved “{Path(result).name}” in {folder}{more}.", 12000)
+            if not left:
+                self._chapter_target = None
+
+        self._run_export(Task(job), book, store, path.name, on_done=saved)
+
+    # ---------- the time it takes ----------
+
+    def _rates(self) -> tuple[float, float]:
+        """(normal, generation-only) characters a second, measured where possible."""
+        live = self._meter.rate() if self._meter is not None and self._worker is not None else None
+        return estimate.rates(self.settings.rate_normal, self.settings.rate_generation_only, live,
+                              self._generation_only)
+
+    def _keep_rate(self):
+        """A run ended: remember how fast this Mac made audio, in this mode."""
+        meter, self._meter = self._meter, None
+        if meter is None or not meter.worth_keeping():
+            return
+        field = "rate_generation_only" if self._generation_only else "rate_normal"
+        setattr(self.settings, field, round(estimate.blend(getattr(self.settings, field), meter.rate()), 2))
+        self.settings.save()
+
+    def remaining_chars(self) -> int:
+        """Characters still without audio: of the run's blocks (chosen chapters), else the book."""
+        if self.store is None:
+            return 0
+        worker = self._worker
+        if worker is not None and worker.blocks is not None:
+            return sum(self.weights.get(b, 1) for b in worker.ahead if not self.store.has(b))
+        made = self.store.generated()
+        return sum(w for b, w in self.weights.items() if b not in made)
+
+    def eta_text(self) -> str:
+        """"About 2 h 10 min left · 1 h 58 min in audio-generation only mode"."""
+        if self.book is None or not self.order:
+            return ""
+        chars = self.remaining_chars()
+        if chars <= 0:
+            return ""
+        normal, only = self._rates()
+        a, b = estimate.duration_text(chars / normal), estimate.duration_text(chars / only)
+        if not self._generating():
+            return f"The rest takes about {a} ({b} in audio-generation only mode)"
+        if self._generation_only:
+            return f"About {b} left (about {a} with the book on screen)"
+        return f"About {a} left · about {b} in audio-generation only mode"
+
+    def _show_eta(self):
+        text = self.eta_text() if self.settings.read_aloud else ""
+        visible = bool(text) and (self._generating() or self.resume_button.isVisible())
+        self.eta_label.setText(text)
+        self.eta_label.setVisible(visible)
+
+    # ---------- audio-generation only and audio player only ----------
+
+    def _build_audio_pages(self):
+        self.generation_page = GenerationPage()
+        self.generation_page.back_requested.connect(self.leave_audio_page)
+        self.generation_page.stop_requested.connect(self.cancel_generation)
+        self.generation_page.after_chosen.connect(self._set_after_generation)
+        self.player_page = PlayerPage([f"{r:g}×" for r in PLAYBACK_SPEEDS])
+        self.player_page.show_text_requested.connect(self.leave_audio_page)
+        self.player_page.chapters_requested.connect(self._open_contents_from_player)
+        self.player_page.seek_requested.connect(self._seek_in_chapter)
+        self.player_page.chapter_requested.connect(self._go_to_chapter)
+        self.player_page.speed_chosen.connect(self.speed_combo.setCurrentIndex)
+        capsule = self.player_page.capsule
+        capsule.play_clicked.connect(self.toggle_play)
+        capsule.skip_clicked.connect(self.skip)
+        capsule.paragraph_clicked.connect(self.step_paragraph)
+        self._player_chapters: list[tuple[int, str, list[int]]] = []
+        self._player_refreshed = 0.0
+
+    def enter_generation_only(self):
+        """Audio-generation only: the text goes away and the audio is made with nothing
+        else to do (no streaming, no pages to draw); at 100% the chosen file is saved."""
+        if self.book is None or not self.order or not self.settings.read_aloud:
+            return
+        book = self.book
+        if not self._engine_ready():
+            if not self._choose_voice() or not self._still(book) or not self._use_chosen_voice(replace=False):
+                return
+        if self.generator.fraction_done() >= 1:
+            self.statusBar().showMessage("All of this book's audio is ready.", 6000)
+            return
+        self.player.pause()
+        self._generation_only = True
+        self.generation_page.set_book(self.record, self._after_generation)
+        self.pages.setCurrentWidget(self.generation_page)
+        self.toolbar.hide()
+        self.statusBar().hide()
+        if self.page_view is not None:
+            self.page_view.shutdown()  # its render thread has nothing to draw
+            self._views.pop(self.page_view, None)
+        if not self._generating():
+            self._start_generation(self._position_block_or_first(), fresh=False, move=False)
+        if self._meter is not None:
+            self._meter = estimate.RateMeter()  # measure this mode on its own from here
+        self._refresh_audio_pages()
+
+    def enter_player_only(self):
+        """Audio player only: the cover, the chapter and its bar, the whole book's chapters."""
+        if self.book is None or not self.settings.read_aloud:
+            return
+        self._player_chapters = export.chapter_blocks(self.book, self.order) if self.order else []
+        self.player_page.set_book(self.record, self.speed_combo.currentIndex())
+        self.pages.setCurrentWidget(self.player_page)
+        self.toolbar.hide()
+        self.statusBar().hide()
+        self._refresh_audio_pages()
+
+    def leave_audio_page(self):
+        """Back to the book's text (generation carries on)."""
+        if self.book is None:
+            self._show_landing()
+            return
+        self._show_reader()
+        self._setup_view()
+        self._center_on_position(animate=False)
+
+    def _keep_rate_partial(self):
+        """Leaving generation-only mid-run: keep what was measured there, start afresh."""
+        if self._meter is not None:
+            was, self._generation_only = self._generation_only, True
+            self._keep_rate()
+            self._generation_only = was
+            self._meter = estimate.RateMeter() if self._worker is not None else None
+
+    def _set_after_generation(self, choice: str):
+        self._after_generation = choice
+
+    def _after_generation_only(self):
+        """Generation-only reached 100%: save what was asked for, without asking where."""
+        if not self._generation_only or self.generator is None or self.generator.fraction_done() < 1:
+            return
+        choice, self._after_generation = self._after_generation, "nothing"
+        folder = Path.home() / "Music"
+        if choice in ("mp3", "m4b"):
+            target = folder / f"{_file_name(self.book.title)}.{choice}"
+            self.export(choice, str(target))
+            self.generation_page.saved.setText(f"Saving “{target.name}” in {folder}…")
+        elif choice == "chapters":
+            chapters = export.chapter_blocks(self.book, self.order)
+            self._chapter_jobs = [(i + 1, title, blocks) for i, (_, title, blocks) in enumerate(chapters)]
+            self._chapter_target = (self.settings.export_format, folder / _file_name(self.book.title), len(chapters))
+            self._save_ready_chapters()
+            self.generation_page.saved.setText(f"Saving the chapters in {folder / _file_name(self.book.title)}…")
+
+    def _chapter_lengths(self) -> tuple[list[float], dict[int, float]]:
+        """Each player chapter's length (ms; estimated where audio isn't made yet), and each block's."""
+        durations = self.store.durations()
+        lengths: dict[int, float] = {
+            b: durations.get(b, self.weights.get(b, 1) / estimate.NARRATION_CHARS_PER_S * 1000) for b in self.order
+        }
+        return [sum(lengths[b] for b in blocks) for _, _, blocks in self._player_chapters], lengths
+
+    def _refresh_audio_pages(self):
+        current = self.pages.currentWidget()
+        if current is self.generation_page and self.generator is not None:
+            self.generation_page.update_progress(self.generator.fraction_done(), self.eta_text(), self._generating())
+        elif current is self.player_page and self.book is not None and self._player_chapters:
+            chapter_lengths, lengths = self._chapter_lengths()
+            block, ms = self.player.position()
+            index = max(0, next((i for i, (_, _, blocks) in enumerate(self._player_chapters)
+                                 if blocks and blocks[-1] >= block), len(self._player_chapters) - 1))
+            blocks = self._player_chapters[index][2]
+            elapsed = sum(lengths[b] for b in blocks if b < block) + (ms if block in lengths else 0)
+            heard = sum(chapter_lengths[:index]) + elapsed
+            total = sum(chapter_lengths) or 1.0
+            self.player_page.update_position(
+                self._player_chapters[index][1], elapsed, chapter_lengths[index], total - heard,
+                chapter_lengths, heard / total, index,
+            )
+            self.player_page.capsule.set_playing(self.player.is_playing())
+            self.player_page.capsule.set_play_enabled(self.capsule.play_button.isEnabled())
+            self.player_page.capsule.set_navigation_enabled(self.capsule.prev_button.isEnabled())
+
+    def _seek_in_chapter(self, fraction: float):
+        """The chapter bar was dragged: go there if its audio is made (else offer to make it)."""
+        if self.book is None or not self._player_chapters:
+            return
+        _, lengths = self._chapter_lengths()
+        block, _ = self.player.position()
+        index = next((i for i, (_, _, blocks) in enumerate(self._player_chapters) if blocks and blocks[-1] >= block), 0)
+        blocks = self._player_chapters[index][2]
+        target = fraction * sum(lengths[b] for b in blocks)
+        for b in blocks:
+            if target < lengths[b] or b == blocks[-1]:
+                if self.store.has(b):
+                    self._auto_follow = True
+                    self.player.seek(b, int(min(target, lengths[b])))
+                    self._refresh_transport()
+                else:
+                    QTimer.singleShot(0, self, lambda: self._go_to(b))
+                break
+            target -= lengths[b]
+        self._refresh_audio_pages()
+
+    def _go_to_chapter(self, index: int):
+        if 0 <= index < len(self._player_chapters) and self._player_chapters[index][2]:
+            block = self._player_chapters[index][2][0]
+            QTimer.singleShot(0, self, lambda: self._go_to(block))
+
+    def _open_contents_from_player(self):
+        if self.book is None:
+            return
+        entries = [(e.title, e.level, ready) for e, ready in zip(self.book.toc, self._toc_ready(), strict=True)]
+        popover = ContentsPopover(self, entries, None)
+        popover.picked.connect(lambda i: QTimer.singleShot(0, self, lambda: self._go_to(self.book.toc[i].block)))
+        self._contents_popover = popover
+        popover.popup_under(self.player_page.chapters_button)
 
     # ---------- quitting ----------
 
