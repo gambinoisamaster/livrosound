@@ -58,6 +58,7 @@ from PySide6.QtGui import (
     QColor,
     QDesktopServices,
     QFont,
+    QCursor,
     QFontMetrics,
     QGuiApplication,
     QImage,
@@ -75,6 +76,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QLabel,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QStackedWidget,
@@ -84,7 +86,9 @@ from PySide6.QtWidgets import (
 )
 from shiboken6 import isValid
 
-from .. import bookinfo, export, paths, shelf
+from .. import bookinfo, dictionary, export, paths, shelf
+from ..annotations import COLORS, Annotations
+from ..search import FoldedBook, Match, nearest
 from ..audio_store import AudioStore, Cue, cue_at
 from ..book import Book
 from ..engines import load_engines
@@ -106,11 +110,15 @@ from .reflow_view import ReflowView
 from .theme import Theme, theme_for, tooltip_stylesheet, ui_font
 from .widgets import (
     ContentsPopover,
+    DefinitionPopover,
+    FindBar,
+    NotesPopover,
     GradientProgressBar,
     PlayerCapsule,
     ThemesPopover,
     VoicePreviews,
     aa_icon,
+    color_icon,
     confirm,
     inform,
     list_icon,
@@ -129,6 +137,7 @@ IMPORT_PROGRESS_DELAY_MS = 300  # a cached book opens without flashing the progr
 READY_SOUND = paths.ASSETS_DIR / "sounds" / "ready.wav"
 INFO_FADE_MS = 3000  # the page and progress fade this long after the reader last moved
 PAGE_COUNT_DELAY_MS = 400  # counting a reflowed book's pages waits for resizing to settle
+FIND_COLOR = "#FF9F1A"  # the current Find match, under the reading highlight
 STYLE_FIELDS = ("font_family", "font_weight", "line_spacing", "paragraph_spacing", "word_spacing",
                 "letter_spacing", "justify", "margin_left", "margin_right", "max_column")
 BOOK_FILTER = "Books (*.pdf *.epub *.docx *.txt)"
@@ -195,6 +204,19 @@ def _opening_block(book: Book) -> int:
         elif block.kind == "paragraph" and len(block.text) >= 60:
             return heading if 0 <= heading and i - heading <= 4 else i
     return 0
+
+
+def _word_around(text: str, char: int) -> str:
+    """The word holding text[char] (letters, digits, apostrophes and hyphens inside it)."""
+    if not 0 <= char < len(text):
+        return ""
+    start = end = char
+    keep = lambda c: c.isalnum() or c in "'’-"  # noqa: E731
+    while start > 0 and keep(text[start - 1]):
+        start -= 1
+    while end < len(text) and keep(text[end]):
+        end += 1
+    return text[start:end].strip("'’-")
 
 
 def _system_is_dark() -> bool:
@@ -383,6 +405,23 @@ class MainWindow(QMainWindow):
         self._ready_sound: QSoundEffect | None = None
         self._views: dict[QWidget, tuple[Book, str]] = {}  # view -> (book, mode) it shows
         self._told_missing = ""  # the book whose PDF couldn't be found, already said
+        self.annotations: Annotations | None = None  # the open book's highlights and notes
+        self._folded: FoldedBook | None = None  # the open book, ready to search (built on the first Find)
+        self._matches: list[Match] = []
+        self._match = -1  # the current Find match
+        self._notes_popover: NotesPopover | None = None
+        self.define = dictionary.define  # Look Up (tests answer instead)
+        self._definition_popover: DefinitionPopover | None = None
+        self._reading_save_timer = QTimer(self)  # without audio, the page on screen is the position
+        self._reading_save_timer.setSingleShot(True)
+        self._reading_save_timer.setInterval(1500)
+        self._reading_save_timer.timeout.connect(lambda: self._save_position(force=True))
+        self.ask_note: Callable[[str, str], str | None] = self._ask_note
+        self._pending_click: tuple[int, int] | None = None
+        self._click_timer = QTimer(self)  # a click waits to see whether it's half of a double click
+        self._click_timer.setSingleShot(True)
+        self._click_timer.setInterval(max(150, QApplication.doubleClickInterval()))
+        self._click_timer.timeout.connect(self._handle_click)
         self.reflow_view: ReflowView | None = None
         self.page_view: PageView | None = None
         self.view: ReflowView | PageView | None = None
@@ -442,6 +481,17 @@ class MainWindow(QMainWindow):
         self.settings_action.setMenuRole(QAction.MenuRole.PreferencesRole)
         self.settings_action.triggered.connect(self.open_settings)
         file_menu.addAction(self.settings_action)
+        edit_menu = self.menuBar().addMenu("Edit")
+        for text, keys, slot in (
+            ("Find…", QKeySequence.StandardKey.Find, self.open_find),
+            ("Find Next", QKeySequence.StandardKey.FindNext, lambda: self._step_match(1)),
+            ("Find Previous", QKeySequence.StandardKey.FindPrevious, lambda: self._step_match(-1)),
+        ):
+            action = QAction(text, self)
+            action.setShortcut(QKeySequence(keys))
+            action.triggered.connect(slot)
+            edit_menu.addAction(action)
+        self.find_action = edit_menu.actions()[0]
         view_menu = self.menuBar().addMenu("View")
         for text, keys, step in (("Larger Text", "Ctrl++", 1), ("Smaller Text", "Ctrl+-", -1)):
             action = QAction(text, self)
@@ -497,6 +547,7 @@ class MainWindow(QMainWindow):
         self.new_action = action("New Book", self.open_book_dialog)
         # Like Apple Books: a list button for the chapters, "Aa" for themes and text.
         self.contents_button = pill("Contents", "The book's chapters", self._open_contents, QSize(20, 16))
+        self.notes_button = pill("Notes", "Your highlights and notes in this book", self._open_notes, QSize(16, 16))
         self.themes_button = pill("", "Themes, text size, layout and highlight", self._open_themes, QSize(36, 24))
         self.regenerate_action = action("Re-Generate Audio", self.regenerate)
 
@@ -568,6 +619,11 @@ class MainWindow(QMainWindow):
         self._page_count_timer.setInterval(PAGE_COUNT_DELAY_MS)
         self._page_count_timer.timeout.connect(self._count_pages)
 
+        self.find_bar = FindBar(self.stage)
+        self.find_bar.query_changed.connect(self._find)
+        self.find_bar.step.connect(self._step_match)
+        self.find_bar.closed.connect(self._close_find)
+
     def _build_status_bar(self):
         # Bottom right: the generation bar; Export MP3 in its place at 100%, or the
         # fern Resume Generating once generation was stopped.
@@ -621,6 +677,10 @@ class MainWindow(QMainWindow):
         info.adjustSize()
         info.move(16, stage.height() - info.height() - 14)
         info.raise_()
+        if not self.find_bar.isHidden():
+            self.find_bar.adjustSize()
+            self.find_bar.move(stage.width() - self.find_bar.width() - 24, 14)
+            self.find_bar.raise_()
 
     def _place_title(self):
         """Center the title on the toolbar; a title too long for that slides right
@@ -682,6 +742,8 @@ class MainWindow(QMainWindow):
         view.clicked.connect(self._on_view_clicked)
         view.user_scrolled.connect(self._suspend_auto_follow)
         view.verticalScrollBar().valueChanged.connect(lambda _v, v=view: self._on_view_moved(v))
+        view.selection_made.connect(lambda point, v=view: self._on_selection_made(v, point))
+        view.context_requested.connect(lambda block, char, point, v=view: self._on_view_context(v, block, char, point))
         view.hide()
         return view
 
@@ -732,6 +794,7 @@ class MainWindow(QMainWindow):
         self._highlight = None
         self._follow_block = -1
         view.setFocus()
+        self._refresh_marks()
         self._update_reading_info()
         self._page_count_timer.start()
 
@@ -962,13 +1025,14 @@ class MainWindow(QMainWindow):
         layout = dialogs.LayoutDialog.ask(self, book, *self._layout_previews(book))
         if layout is not None:
             record.layout = layout
-        generate = layout is not None and self._choose_voice()
+        generate = layout is not None and self.settings.read_aloud and self._choose_voice()
         if self._closing:
             return
         self._close_book()  # (nothing is open, unless something slipped in under the dialogs)
         self._open_book(book, record)
         if not generate:
-            self.statusBar().showMessage("Click any part of the text to choose a voice and start making audio.")
+            if self.settings.read_aloud:
+                self.statusBar().showMessage("Click any part of the text to choose a voice and start making audio.")
             return
         if self._use_chosen_voice(replace=False):
             self._ask_where_to_start()
@@ -1190,7 +1254,17 @@ class MainWindow(QMainWindow):
             )
 
         task = Task(job)
-        close_progress = self._progress_for(task, f"Opening “{record.title}”")
+        progress: list[Callable[[], None]] = []  # closes the progress dialog, once the task has started
+
+        def close_progress():
+            for close in progress:
+                close()
+
+        def start():
+            # The progress dialog only once the opening really starts: shown while the book
+            # waits for its old worker, it would hold up the very step that starts it.
+            progress.append(self._progress_for(task, f"Opening “{record.title}”"))
+            self._start_task(task, done, failed, cancelled)
 
         def done(book: Book):
             close_progress()
@@ -1216,11 +1290,13 @@ class MainWindow(QMainWindow):
             close_progress()
             self.statusBar().showMessage("Opening cancelled.", 4000)
 
-        self._when_released(record.book_id, lambda: self._start_task(task, done, failed, cancelled))
+        self._when_released(record.book_id, start)
 
     def _offer_to_continue(self):
         """A resumed book whose generation was left unfinished: "Continue generating audio?" (no ding)."""
         rec = self.record
+        if not self.settings.read_aloud:
+            return
         if not self.order or rec is None or rec.generation_start < 0 or not self._engine_ready():
             return
         fraction = self.generator.fraction_done()
@@ -1249,6 +1325,9 @@ class MainWindow(QMainWindow):
             record.generated_fraction, record.generation_start = 0.0, -1
         self._before = _spoken_before(book)
         record.spoken_chars = self._before[-1]
+        self.annotations = Annotations(book.book_id)
+        self._folded, self._matches, self._match = None, [], -1
+        self.find_bar.hide()
         self._cues.clear()
         self._gate = self._pending_char = None
         self._pick_mode = self._at_end = False
@@ -1290,7 +1369,7 @@ class MainWindow(QMainWindow):
         self.player.pause()
         if save:
             self._save_position(force=True)
-        for name in ("_contents_popover", "_themes_popover"):
+        for name in ("_contents_popover", "_themes_popover", "_notes_popover"):
             popover = self._popover(name)
             if popover is not None:
                 popover.close()
@@ -1302,6 +1381,10 @@ class MainWindow(QMainWindow):
             self.view.clear_highlight()
         store = self.store
         self.book = self.record = self.store = self.generator = self.timeline = None
+        self.annotations, self._folded, self._matches, self._match = None, None, [], -1
+        self._click_timer.stop()
+        self._pending_click = None
+        self.find_bar.hide()
         self._release_store(store)
         self.order, self.weights, self._cues = [], {}, {}
         self._gate = self._pending_char = self._highlight = None
@@ -1352,6 +1435,13 @@ class MainWindow(QMainWindow):
         if self.record is None or self.store is None:
             return
         block, ms = self.player.position()
+        if self.view is not None and self.book is not None and (
+            not self.settings.read_aloud or not self.store.durations()
+        ):
+            # Reading without audio: where the reader is is the page on screen.
+            block, ms = self.view.current_block(), 0
+            if block != self.player.position()[0]:
+                self.player.seek(block, 0)
         if not force and (block, ms) == self._saved_position:
             return
         self._saved_position = (block, ms)
@@ -1671,13 +1761,18 @@ class MainWindow(QMainWindow):
         started = has_book and bool(self.record.engine) and (
             self.record.generation_start >= 0 or bool(self.store.generated())
         )
-        self.progress.setVisible(running or exporting)
-        self.cancel_button.setVisible(running and not exporting)
+        audio = self.settings.read_aloud  # off: an e-reader, without any audio controls
+        self.progress.setVisible(exporting or (running and audio))
+        self.cancel_button.setVisible(running and not exporting and audio)
         self.cancel_button.setEnabled(True)
-        self.export_button.setVisible(done and not running and not exporting)
-        self.resume_button.setVisible(has_book and not running and not done and started and bool(self.order))
+        self.export_button.setVisible(done and not running and not exporting and audio)
+        self.resume_button.setVisible(
+            audio and has_book and not running and not done and started and bool(self.order)
+        )
+        self.regenerate_action.setVisible(audio)
         self.regenerate_action.setEnabled(has_book and self._worker is None and not exporting)
         self.contents_button.setEnabled(has_book)
+        self.notes_button.setEnabled(has_book)
         self.themes_button.setEnabled(has_book)
         if running:
             self._set_progress(self.generator.fraction_done())
@@ -1713,9 +1808,25 @@ class MainWindow(QMainWindow):
     # ---------- going somewhere in the book ----------
 
     def _on_view_clicked(self, block: int, char: int):
+        """A click on the text waits a moment: the first half of a double click (selecting
+        a word to look up) must not start playback."""
         if self.book is None or not 0 <= block < len(self.book.blocks):
             return
+        self._pending_click = (block, char)
+        self._click_timer.start()
+
+    def _handle_click(self):
+        click, self._pending_click = self._pending_click, None
+        if click is None or self.book is None:
+            return
+        block, char = click
+        if self.view is not None and self.view.selected_range() is not None:
+            return  # a word was just selected
         link = self.book.blocks[block].link
+        if not self.settings.read_aloud:  # an e-reader: only the book's own contents lines do something
+            if link >= 0:
+                self.view.scroll_to(link, 0)
+            return
         if link >= 0:  # a line of the book's own contents page: like picking that chapter
             self.view.scroll_to(link, 0)
             QTimer.singleShot(0, self, lambda: self._go_to(link))
@@ -1731,7 +1842,7 @@ class MainWindow(QMainWindow):
 
     def _go_to(self, block: int, char: int = 0):
         """Flow 8: play from there if its audio is ready, else offer to make it."""
-        if self.book is None or self.timeline is None:
+        if self.book is None or self.timeline is None or not self.settings.read_aloud:
             return
         target = self.timeline.first_at_or_after(block)
         if target is None:
@@ -1870,7 +1981,11 @@ class MainWindow(QMainWindow):
         inform(self, "The audio can't be played.", message)
 
     def _refresh_transport(self):
-        """Play enables where there's audio to play and no 5% wait; the rest once any audio exists."""
+        """Play enables where there's audio to play and no 5% wait; the rest once any audio exists.
+        Read without audio, the player is hidden."""
+        audio = self.settings.read_aloud
+        self.capsule.setVisible(audio)
+        self.speed_combo.setVisible(audio)
         has_book = self.book is not None and self.store is not None and bool(self.order)
         playing = self.player.is_playing()
         here = self.timeline.first_at_or_after(self.player.position()[0]) if has_book else None
@@ -1883,6 +1998,11 @@ class MainWindow(QMainWindow):
         plain = not event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier  # macOS marks arrows "keypad"
         if self.pages.currentWidget() is self.reader_page and plain:
             key = event.key()
+            if not self.settings.read_aloud and self.view is not None and key in (
+                Qt.Key.Key_Space, Qt.Key.Key_Left, Qt.Key.Key_Right
+            ):
+                self.view.page_step(-1 if key == Qt.Key.Key_Left else 1)  # an e-reader: keys turn pages
+                return
             if key == Qt.Key.Key_Space:
                 self.toggle_play()
                 return
@@ -2105,10 +2225,28 @@ class MainWindow(QMainWindow):
             self._follow_appearance()
         elif field in ("highlight", "highlight_unit"):
             self._apply_highlight_setting()
+        elif field == "read_aloud":
+            self._set_read_aloud(s.read_aloud)
         elif field in ("show_page_numbers", "show_read_percent", "always_show_status_bar"):
             self._page_count_timer.start()
             self._update_reading_info()
         s.save()
+
+    def _set_read_aloud(self, on: bool):
+        """Read aloud on or off. Off, LivroSound is an e-reader: playback stops, a running
+        generation stops (what's made is kept), and the player and audio controls go."""
+        if not on:
+            self.player.pause()
+            if self._worker is not None:
+                self._pending_start = None
+                self._worker.cancel()
+            self._gate = None
+            self.statusBar().clearMessage()
+        elif self.book is not None and not self._engine_ready():
+            self.statusBar().showMessage("Click any part of the text to choose a voice and start making audio.", 8000)
+        self._refresh_transport()
+        self._show_generation_state()
+        self._place_overlays()
 
     def _reading_style(self) -> ReadingStyle:
         s = self.settings
@@ -2129,12 +2267,224 @@ class MainWindow(QMainWindow):
     def _reading(self) -> bool:
         return self.book is not None and self.pages.currentWidget() is self.reader_page
 
+    # ---------- highlights, notes and Look Up ----------
+
+    def _refresh_marks(self):
+        """The reader's highlights and the current Find match, on the page."""
+        if self.view is None or self.book is None:
+            return
+        marks = []
+        for item in self.annotations.all() if self.annotations is not None else []:
+            marks += [(b, a, e, COLORS[item.color]) for b, a, e in item.spans(self.book)]
+        if 0 <= self._match < len(self._matches):
+            m = self._matches[self._match]
+            marks.append((m.block, m.start, m.end, FIND_COLOR))
+        self.view.set_marks(marks)
+
+    def _on_selection_made(self, view, point: QPoint):
+        self._click_timer.stop()
+        self._pending_click = None
+        if view is self.view and view.selected_range() is not None:
+            QTimer.singleShot(0, self, lambda: self._popup(self.selection_menu(), point))
+
+    def _on_view_context(self, view, block: int, char: int, point: QPoint):
+        if view is not self.view or self.book is None:
+            return
+        rng = view.selected_range()
+        item = self.annotations.at(block, char) if self.annotations is not None else None
+        if rng is not None and rng[0] <= (block, char) < rng[1]:
+            menu = self.selection_menu()
+        elif item is not None:
+            menu = self.annotation_menu(item.id)
+        else:
+            menu = self.word_menu(block, char)
+        QTimer.singleShot(0, self, lambda: self._popup(menu, point))
+
+    @staticmethod
+    def _popup(menu: QMenu, point: QPoint):
+        menu.exec(point)
+
+    def selection_menu(self) -> QMenu:
+        """What to do with selected text: highlight it (five colors), add a note, copy it,
+        look it up, find it in the book."""
+        menu = QMenu(self)
+        rng = self.view.selected_range() if self.view is not None else None
+        if rng is None or self.book is None:
+            return menu
+        text = self._selected_text(rng)
+        menu.addSection("Highlight")
+        for name, color in COLORS.items():
+            action = menu.addAction(color_icon(color), name.capitalize())
+            action.triggered.connect(lambda _=False, n=name, r=rng: self.add_highlight(r, n))
+        menu.addSeparator()
+        menu.addAction("Add Note…").triggered.connect(lambda: self.add_highlight(rng, note=True))
+        menu.addAction("Copy").triggered.connect(lambda: QApplication.clipboard().setText(text))
+        short = " ".join(text.split()[:4])
+        if text and len(text.split()) <= 4:
+            menu.addAction(f"Look Up “{short}”").triggered.connect(lambda: self.look_up(short))
+        if text:
+            label = short if len(text.split()) <= 4 else short + "…"
+            menu.addAction(f"Find “{label}” in Book").triggered.connect(lambda: self.open_find(" ".join(text.split())))
+        return menu
+
+    def annotation_menu(self, item_id: str) -> QMenu:
+        menu = QMenu(self)
+        item = self.annotations.get(item_id) if self.annotations is not None else None
+        if item is None:
+            return menu
+        colors = menu.addMenu("Color")
+        for name, color in COLORS.items():
+            action = colors.addAction(color_icon(color), name.capitalize())
+            action.setCheckable(True)
+            action.setChecked(name == item.color)
+            action.triggered.connect(lambda _=False, n=name: self._update_highlight(item_id, color=n))
+        menu.addAction("Edit Note…" if item.note else "Add Note…").triggered.connect(lambda: self._edit_note(item_id))
+        menu.addAction("Copy").triggered.connect(lambda: QApplication.clipboard().setText(item.text))
+        menu.addSeparator()
+        menu.addAction("Remove Highlight").triggered.connect(lambda: self._remove_highlight(item_id))
+        return menu
+
+    def word_menu(self, block: int, char: int) -> QMenu:
+        """A right click on the text: look up the word there, or read aloud from there."""
+        menu = QMenu(self)
+        word = _word_around(self.book.blocks[block].text, char)
+        if word:
+            menu.addAction(f"Look Up “{word}”").triggered.connect(lambda: self.look_up(word))
+        if self.settings.read_aloud:
+            menu.addAction("Read Aloud from Here").triggered.connect(lambda: self._go_to(block, char))
+        return menu
+
+    def _selected_text(self, rng) -> str:
+        from ..annotations import text_between
+
+        return text_between(self.book, *rng)
+
+    def add_highlight(self, rng, color: str = "yellow", *, note: bool = False):
+        if self.annotations is None or self.book is None:
+            return
+        text = ""
+        if note:
+            text = self.ask_note("Add a Note", "")
+            if text is None:
+                return
+        self.annotations.add(self.book, rng[0], rng[1], color, text)
+        if self.view is not None:
+            self.view.clear_selection()
+        self._refresh_marks()
+
+    def _update_highlight(self, item_id: str, **change):
+        if self.annotations is not None:
+            self.annotations.update(item_id, **change)
+            self._refresh_marks()
+
+    def _edit_note(self, item_id: str):
+        item = self.annotations.get(item_id) if self.annotations is not None else None
+        if item is None:
+            return
+        text = self.ask_note("Edit Note" if item.note else "Add a Note", item.note)
+        if text is not None and self.annotations is not None:
+            self._update_highlight(item_id, note=text)
+
+    def _remove_highlight(self, item_id: str):
+        if self.annotations is not None:
+            self.annotations.remove(item_id)
+            self._refresh_marks()
+
+    def _ask_note(self, title: str, current: str) -> str | None:
+        from PySide6.QtWidgets import QInputDialog
+
+        text, ok = QInputDialog.getMultiLineText(self, title, "Note:", current)
+        return text if ok else None
+
+    def _open_notes(self):
+        if self.book is None or self.annotations is None:
+            return
+        entries = []
+        for item in self.annotations.all():
+            chapter = self.book.chapter_of(item.start_block)
+            entries.append((item.id, COLORS[item.color], item.text, item.note, chapter.title if chapter else ""))
+        popover = NotesPopover(self, entries)
+        popover.picked.connect(self._go_to_note)
+        self._notes_popover = popover
+        popover.popup_under(self.notes_button)
+
+    def _go_to_note(self, item_id: str):
+        item = self.annotations.get(item_id) if self.annotations is not None else None
+        if item is not None and self.view is not None:
+            self._suspend_auto_follow()
+            self.view.scroll_to(item.start_block, item.start_char)
+
+    def look_up(self, word: str):
+        """Look Up: the Mac's own dictionary offline, with Merriam-Webster and Oxford online."""
+        word = " ".join(word.split()).strip(" .,;:!?\"'“”‘’()[]")
+        if not word:
+            return
+        definition = self.define(word)
+        links = [
+            ("Dictionary", dictionary.dictionary_app_url(word), "Open in the Dictionary app (offline)"),
+            ("Merriam-Webster", dictionary.merriam_webster_url(word), "merriam-webster.com (online)"),
+            ("Oxford", dictionary.oxford_url(word), "oxfordlearnersdictionaries.com (online)"),
+        ]
+        popover = DefinitionPopover(self, word, definition, links)
+        popover.open_url.connect(lambda url: QDesktopServices.openUrl(QUrl(url)))
+        self._definition_popover = popover
+        popover.popup_at(QCursor.pos())
+
+    # ---------- find ----------
+
+    def open_find(self, query: str = ""):
+        """Find in the book (⌘F)."""
+        if not self._reading():
+            return
+        self.find_bar.open()
+        if query:
+            self.find_bar.field.setText(query)
+            self._find(query)
+        self._place_overlays()
+
+    def _find(self, query: str):
+        if self.book is None:
+            return
+        if self._folded is None:
+            self._folded = FoldedBook(self.book)
+        self._matches = self._folded.find(query) if query.strip() else []
+        start = self.view.current_block() if self.view is not None else 0
+        self._match = nearest(self._matches, start) if self._matches else -1
+        self._show_match()
+
+    def _step_match(self, step: int):
+        if not self._matches:
+            if self._reading() and self.find_bar.isHidden():
+                self.open_find()
+            return
+        self._match = (self._match + step) % len(self._matches)
+        self._show_match()
+
+    def _show_match(self):
+        from ..search import MAX_MATCHES
+
+        total = len(self._matches)
+        self.find_bar.set_count(self._match, total, capped=total >= MAX_MATCHES)
+        self._refresh_marks()
+        if 0 <= self._match < total and self.view is not None:
+            m = self._matches[self._match]
+            self._suspend_auto_follow()
+            self.view.scroll_to(m.block, m.start)
+
+    def _close_find(self):
+        self._matches, self._match = [], -1
+        self._refresh_marks()
+        if self.view is not None:
+            self.view.setFocus()
+
     # ---------- page and progress ----------
 
     def _on_view_moved(self, view):
         if view is self.view:
             self._update_reading_info()
             self._poke_reading_info()
+            if self.book is not None and (not self.settings.read_aloud or not self.store.durations()):
+                self._reading_save_timer.start()
 
     def _count_pages(self):
         if self.view is self.reflow_view and self.view is not None and self.settings.show_page_numbers:

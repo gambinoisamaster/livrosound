@@ -47,6 +47,13 @@ family, weight, spacing, justification, the margins beside the text and the
 widest the column gets. ReflowView applies all of it; PageView, which shows a
 PDF's own pages, only the margins.
 
+Marks and selections: set_marks() lays colored spans under the reading
+highlight (the reader's own highlights, the current Find match). Dragging
+selects text (ReflowView: Qt's own selection; PageView: whole words, across
+lines and pages); on release with something selected, selection_made(global
+point) asks the window to offer Highlight / Note / Copy / Look Up.
+A right click emits context_requested(block, char, global point).
+
 ensure_reading_fonts() makes the book's serif (Iowan Old Style) visible to Qt;
 macOS ships it but hides it from apps. ReflowView calls it; the main window
 should call it at startup too, so every theme.reading_font() (the toolbar's
@@ -150,6 +157,8 @@ class ReaderView:
 
     clicked = Signal(int, int)  # (block, char) the user clicked
     user_scrolled = Signal()  # scrolled by hand: the main window suspends auto-follow
+    selection_made = Signal(QPoint)  # a drag (or double click) selected text; global point
+    context_requested = Signal(int, int, QPoint)  # right click: (block, char), global point
 
     # ---------- the interface ----------
 
@@ -185,6 +194,17 @@ class ReaderView:
 
     def set_page_mode(self, mode: str) -> None:
         """Continuous scroll, single page or double page (one of PAGE_MODES)."""
+        raise NotImplementedError
+
+    def set_marks(self, marks: list[tuple[int, int, int, str]]) -> None:
+        """Colored spans (block, start, end, "#RRGGBB") drawn under the reading highlight."""
+        raise NotImplementedError
+
+    def selected_range(self) -> tuple[tuple[int, int], tuple[int, int]] | None:
+        """The selected text: ((block, char), (block, char after its last char)), or None."""
+        raise NotImplementedError
+
+    def clear_selection(self) -> None:
         raise NotImplementedError
 
     def set_style(self, style: ReadingStyle) -> None:

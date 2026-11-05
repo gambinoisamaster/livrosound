@@ -1411,3 +1411,110 @@ def test_word_and_paragraph_highlighting_follow_the_audio(script, tmp_path):
     block, start, end = window._highlight
     sentence = expected_highlight(window)
     assert sentence[1] <= start < end <= sentence[2] and " " not in window.book.blocks[block].text[start:end]
+
+
+# ---------- highlights, notes, Look Up, Find, reading without audio ----------
+
+
+def _select(window, start: tuple[int, int], end: tuple[int, int]) -> None:
+    """Select text in the reflow view as a drag would."""
+    view = window.view
+    cursor = view.textCursor()
+    cursor.setPosition(view._doc_pos(*start))
+    cursor.setPosition(view._doc_pos(*end), cursor.MoveMode.KeepAnchor)
+    view.setTextCursor(cursor)
+
+
+def test_selecting_text_offers_highlights_notes_and_look_up(script, tmp_path):
+    window, _, _ = script.window()
+    script.voice = None
+    open_book(script, window, write_txt(tmp_path))
+    block = next(i for i, b in enumerate(window.book.blocks) if b.kind == "paragraph")
+    _select(window, (block, 4), (block, 8))
+    assert window.view.selected_range() == ((block, 4), (block, 8))
+    menu = window.selection_menu()
+    labels = [a.text() for a in menu.actions() if a.text()]
+    word = window.book.blocks[block].text[4:8]
+    assert labels[:6] == ["Highlight", "Yellow", "Green", "Blue", "Pink", "Purple"]
+    assert "Add Note…" in labels and "Copy" in labels and f"Look Up “{word}”" in labels
+    next(a for a in menu.actions() if a.text() == "Blue").trigger()
+    [item] = window.annotations.all()
+    assert (item.start_block, item.start_char, item.end_char, item.color) == (block, 4, 8, "blue")
+    assert window.view.selected_range() is None
+    assert any(m[:3] == (block, 4, 8) for m in window.view._marks)
+    # Right-click on it: change color, add a note, remove it.
+    menu = window.annotation_menu(item.id)
+    window.ask_note = lambda title, current: "A note"
+    next(a for a in menu.actions() if a.text() == "Add Note…").trigger()
+    assert window.annotations.get(item.id).note == "A note"
+    window._open_notes()
+    notes = window._notes_popover
+    assert notes.list.count() == 1
+    notes.list.itemClicked.emit(notes.list.item(0))
+    next(a for a in window.annotation_menu(item.id).actions() if a.text() == "Remove Highlight").trigger()
+    assert window.annotations.all() == []
+    # Add Note… on a selection makes a highlight with its note.
+    _select(window, (block, 0), (block, 3))
+    next(a for a in window.selection_menu().actions() if a.text() == "Add Note…").trigger()
+    assert [a.note for a in window.annotations.all()] == ["A note"]
+    # Look Up shows the Mac's definition with the dictionaries' links.
+    window.define = lambda w: f"{w}: a test definition."
+    window.look_up(" rain, ")
+    popover = window._definition_popover
+    assert popover.definition.text() == "rain: a test definition."
+    assert [b.text() for b in popover.link_buttons] == ["Dictionary", "Merriam-Webster", "Oxford"]
+    menu = window.word_menu(block, 1)
+    assert [a.text() for a in menu.actions()][0].startswith("Look Up “")
+
+
+def test_find_in_book(script, tmp_path):
+    window, _, _ = script.window()
+    script.voice = None
+    open_book(script, window, write_txt(tmp_path))
+    window.find_action.trigger()
+    assert not window.find_bar.isHidden()
+    window.open_find("the")
+    total = len(window._matches)
+    assert total > 3 and window.find_bar.count.text() == f"1 of {total}"
+    first = window._matches[0]
+    assert (first.block, first.start, first.end, mw.FIND_COLOR) in window.view._marks
+    window._step_match(1)
+    assert window._match == 1 and window.find_bar.count.text() == f"2 of {total}"
+    window._step_match(-2)
+    assert window._match == total - 1  # wraps
+    window.open_find("no such words here")
+    assert window.find_bar.count.text() == "Not found"
+    window.find_bar.close_bar()
+    assert window._matches == [] and not any(m[3] == mw.FIND_COLOR for m in window.view._marks)
+
+
+def test_reading_without_audio(script, tmp_path):
+    window, _, _ = script.window()
+    window.settings.read_aloud = False
+    path = write_txt(tmp_path)
+    open_book(script, window, path)  # no voice is asked for, nothing is generated
+    assert script.asked == [] and window._worker is None
+    assert window.capsule.isHidden() and window.speed_combo.isHidden()
+    assert not window.regenerate_action.isVisible()
+    block = len(window.book.blocks) - 3
+    window.view.clicked.emit(block, 0)
+    wait(500)
+    assert script.asked == [] and window._worker is None  # a click doesn't ask about audio
+    window.view.scroll_to(block, 0, animate=False)
+    window.close()
+    wait_until(lambda: not _threads_running(window))
+    record = Library.load().get(window_book_id(path))
+    assert record.position_block >= block - 3  # where the page was
+    second, _, _ = script.window()
+    second.settings.read_aloud = False
+    pick_from_library(second, record.book_id)
+    wait_until(lambda: second.book is not None and second._task is None)
+    assert second.player.position()[0] == record.position_block and script.asked == []
+    second._change_setting("read_aloud", True)
+    assert not second.capsule.isHidden()
+
+
+def window_book_id(path: Path) -> str:
+    from livrosound.ingest import book_id_for
+
+    return book_id_for(path)

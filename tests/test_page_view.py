@@ -13,8 +13,8 @@ from pathlib import Path
 
 import pymupdf
 import pytest
-from PySide6.QtCore import QPoint, QPointF, Qt
-from PySide6.QtGui import QColor, QWheelEvent
+from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
+from PySide6.QtGui import QColor, QMouseEvent, QWheelEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
@@ -817,3 +817,27 @@ def test_margins_move_the_pages(view, qapp):
     qapp.processEvents()
     after = view.page_rect(0)
     assert after.left() >= 200 and after.width() < before.width()
+
+
+def test_dragging_selects_whole_words_and_marks_are_drawn(view, pdf_book, qapp):
+    block = next(i for i, b in enumerate(pdf_book.blocks) if len(b.words) > 6 and b.words[0][0] == 0)
+    words = pdf_book.blocks[block].words
+    start = view.map_box(0, words[1][1:5]).center().toPoint()
+    end = view.map_box(0, words[4][1:5]).center().toPoint()
+    made = []
+    view.selection_made.connect(made.append)
+    QTest.mousePress(view.viewport(), Qt.MouseButton.LeftButton, pos=start)
+    QTest.mouseMove(view.viewport(), end)
+    move = QMouseEvent(QEvent.Type.MouseMove, QPointF(end), QPointF(view.viewport().mapToGlobal(end)),
+                       Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+    QApplication.sendEvent(view.viewport(), move)
+    QTest.mouseRelease(view.viewport(), Qt.MouseButton.LeftButton, pos=end)
+    assert view.selected_range() == ((block, words[1][5]), (block, words[4][6])) and made
+    assert view._selection_bands
+    view.clear_selection()
+    assert view.selected_range() is None
+    before = view.viewport().grab().toImage()
+    view.set_marks([(block, words[0][5], words[2][6], "#FFD84D")])
+    qapp.processEvents()
+    after = view.viewport().grab().toImage()
+    assert before != after and view._mark_bands

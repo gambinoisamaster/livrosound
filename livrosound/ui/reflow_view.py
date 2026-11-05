@@ -360,6 +360,7 @@ class ReflowView(ReaderView, QTextEdit):
         self._column = 0  # the viewport's width: the text column plus its padding
         self._highlight: tuple[int, int, int] | None = None  # (block, start, end)
         self._style = ReadingStyle()
+        self._marks: list[tuple[int, int, int, str]] = []
         self._page_height = 0  # paged: the height of a page (the viewport's)
         self._total_pages: int | None = None  # counted on demand (it lays the whole book out)
         self._init_reader_view()
@@ -391,7 +392,7 @@ class ReflowView(ReaderView, QTextEdit):
             (QPalette.ColorRole.Window, page),
             (QPalette.ColorRole.Text, text),
             (QPalette.ColorRole.WindowText, text),
-            (QPalette.ColorRole.Highlight, QColor(theme.highlight)),
+            (QPalette.ColorRole.Highlight, QColor(themes.selection_color(theme))),
             (QPalette.ColorRole.HighlightedText, text),
         ):
             palette.setColor(role, color)
@@ -515,6 +516,26 @@ class ReflowView(ReaderView, QTextEdit):
     def clear_highlight(self) -> None:
         self._highlight = None
         self._refresh_selections()
+
+    def set_marks(self, marks: list[tuple[int, int, int, str]]) -> None:
+        self._marks = [m for m in marks if self._book is not None and 0 <= m[0] < len(self._book.blocks)]
+        self._refresh_selections()
+
+    def selected_range(self) -> tuple[tuple[int, int], tuple[int, int]] | None:
+        cursor = self.textCursor()
+        if self._book is None or not cursor.hasSelection():
+            return None
+        start = self._locate(cursor.selectionStart())
+        last = self._locate(max(cursor.selectionStart(), cursor.selectionEnd() - 1))
+        if start is None or last is None:
+            return None
+        return start, (last[0], last[1] + 1)
+
+    def clear_selection(self) -> None:
+        cursor = self.textCursor()
+        cursor.clearSelection()
+        self.setTextCursor(cursor)
+        self._repaint_if_double()
 
     def scroll_to(self, block: int, char: int = 0, *, animate: bool = True) -> None:
         """Center the block, or — when it's taller than most of the view — the
@@ -899,6 +920,13 @@ class ReflowView(ReaderView, QTextEdit):
     def _refresh_selections(self) -> None:
         """The highlight, plus the underline of a contents line under the pointer."""
         selections = []
+        if self._book is not None:
+            for block, start, end, color in self._marks:
+                fmt = QTextCharFormat()
+                mark = QColor(color)
+                mark.setAlphaF(0.42 if not self._theme.dark else 0.55)
+                fmt.setBackground(mark)
+                selections += [self._selection(a, b, fmt) for a, b in self._runs(block, start, end)]
         if self._book is not None and self._highlight is not None:
             fmt = QTextCharFormat()
             fmt.setBackground(QColor(self._theme.highlight))
@@ -1075,6 +1103,16 @@ class ReflowView(ReaderView, QTextEdit):
         super().mouseReleaseEvent(self._in_flow(event))
         if self.paged():
             self.turn_to(self.verticalScrollBar().value())  # a drag may have scrolled by lines
+        if event.button() == Qt.MouseButton.LeftButton and self.textCursor().hasSelection():
+            self.selection_made.emit(event.globalPosition().toPoint())
+
+    def contextMenuEvent(self, event) -> None:
+        pos = event.pos()
+        if self._page_mode == "double" and pos.x() >= self._column + PAGE_GUTTER / 2:
+            pos = QPoint(pos.x() - self._column - PAGE_GUTTER, pos.y() + self._page_height)
+        hit = self.hit_test(pos)
+        if hit is not None:
+            self.context_requested.emit(*hit, event.globalPos())
 
     def mouseDoubleClickEvent(self, event) -> None:
         super().mouseDoubleClickEvent(self._in_flow(event))

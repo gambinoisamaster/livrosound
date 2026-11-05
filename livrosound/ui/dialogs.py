@@ -1108,6 +1108,8 @@ class SettingsDialog(_Dialog):
     def _reading_tab(self, layout: QVBoxLayout) -> None:
         from .widgets import HIGHLIGHT_UNITS
 
+        self._switch(layout, "read_aloud", "Read books aloud",
+                     "Off: LivroSound is an e-reader only. No audio is made or played.")
         self._switch(layout, "highlight", "Highlight while reading")
         self._segments(layout, "highlight_unit", "Highlighter", HIGHLIGHT_UNITS)
         layout.addWidget(_hint("Word by word follows the narrator's timing within each sentence (an estimate).", 11))
