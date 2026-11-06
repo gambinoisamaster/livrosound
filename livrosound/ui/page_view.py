@@ -445,6 +445,10 @@ class PageView(ReaderView, QAbstractScrollArea):
         self._block_pages: list[int] = []  # each block's page (-1 = none), for current_block
         self._bands: list[Band] = []
         self._highlighted = -1  # the block the bands belong to
+        self._mark_bands: list[tuple[Band, str]] = []  # the reader's highlights and the Find match
+        self._anchor_word: tuple[int, int, int] | None = None  # a drag's first word (block, start, end)
+        self._selection: tuple[tuple[int, int], tuple[int, int]] | None = None
+        self._selection_bands: list[Band] = []
         self._cache: OrderedDict[int, _Entry] = OrderedDict()  # sharp pages
         self._previews: OrderedDict[int, _Entry] = OrderedDict()  # small ones, stretched until a sharp one arrives
         self._failed: set[tuple[int, _Key]] = set()
@@ -472,6 +476,7 @@ class PageView(ReaderView, QAbstractScrollArea):
         self._serial += 1
         self._book = book
         self._bands, self._highlighted = [], -1
+        self._mark_bands, self._selection, self._selection_bands, self._anchor_word = [], None, [], None
         self._cache.clear()
         self._previews.clear()
         self._failed.clear()
@@ -579,6 +584,78 @@ class PageView(ReaderView, QAbstractScrollArea):
         if self._bands:
             self._bands = []
             self.viewport().update()
+
+    def set_marks(self, marks: list[tuple[int, int, int, str]]) -> None:
+        self._mark_bands = []
+        if self._book is not None:
+            for block, start, end, color in marks:
+                if 0 <= block < len(self._book.blocks):
+                    for band in line_bands(self._book.blocks[block].words, start, end):
+                        if 0 <= band.page < len(self._crops):
+                            self._mark_bands.append((band, color))
+        self.viewport().update()
+
+    def selected_range(self) -> tuple[tuple[int, int], tuple[int, int]] | None:
+        return self._selection
+
+    def clear_selection(self) -> None:
+        if self._selection is not None or self._selection_bands:
+            self._selection, self._selection_bands = None, []
+            self.viewport().update()
+
+    def _word_at(self, pos: QPoint) -> tuple[int, int, int] | None:
+        """(block, start char, end char) of the word under a viewport point."""
+        hit = self.hit_test(pos)
+        if hit is None:
+            return None
+        block, char = hit
+        word = next((w for w in self._book.blocks[block].words if w[5] == char), None)
+        return block, char, word[6] if word is not None else char + 1
+
+    def _select_to(self, word: tuple[int, int, int]) -> None:
+        """Select whole words from the drag's first word to this one, in reading order."""
+        a, b = self._anchor_word, word
+        if (b[0], b[1]) < (a[0], a[1]):
+            a, b = b, a
+        self._selection = ((a[0], a[1]), (b[0], b[2]))
+        bands = []
+        for block in range(a[0], min(b[0], a[0] + 400) + 1):
+            words = self._book.blocks[block].words
+            start = a[1] if block == a[0] else 0
+            end = b[2] if block == b[0] else len(self._book.blocks[block].text)
+            bands += [x for x in line_bands(words, start, end) if 0 <= x.page < len(self._crops)]
+        self._selection_bands = bands
+        self.viewport().update()
+
+    def mousePressEvent(self, event) -> None:
+        super().mousePressEvent(event)
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clear_selection()
+            self._anchor_word = self._word_at(event.position().toPoint())
+
+    def mouseMoveEvent(self, event) -> None:
+        super().mouseMoveEvent(event)
+        if event.buttons() & Qt.MouseButton.LeftButton and self._anchor_word is not None:
+            word = self._word_at(event.position().toPoint())
+            if word is not None and (word != self._anchor_word or self._selection is not None):
+                self._select_to(word)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        super().mouseDoubleClickEvent(event)
+        word = self._word_at(event.position().toPoint())
+        if word is not None:
+            self._anchor_word = word
+            self._select_to(word)
+
+    def mouseReleaseEvent(self, event) -> None:
+        super().mouseReleaseEvent(event)
+        if event.button() == Qt.MouseButton.LeftButton and self._selection is not None:
+            self.selection_made.emit(event.globalPosition().toPoint())
+
+    def contextMenuEvent(self, event) -> None:
+        hit = self.hit_test(event.pos())
+        if hit is not None:
+            self.context_requested.emit(*hit, event.globalPos())
 
     def highlight_rects(self) -> list[tuple[int, QRectF]]:
         """The bands as drawn: (page, rect in PDF points)."""
@@ -975,6 +1052,7 @@ class PageView(ReaderView, QAbstractScrollArea):
         h, v = self.horizontalScrollBar().value(), self.verticalScrollBar().value()
         key, dpr = self._key(), self.viewport().devicePixelRatioF()
         highlighted = {band.page for band in self._bands}
+        marked = {band.page for band, _ in self._mark_bands} | {band.page for band in self._selection_bands}
         for page in self._visible_pages():
             rect = QRectF(self._rects[page]).translated(-h, -v)
             self._paint_frame(painter, rect)
@@ -991,6 +1069,8 @@ class PageView(ReaderView, QAbstractScrollArea):
                 painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
                 painter.drawImage(rect, shown.image, QRectF(shown.image.rect()))
                 painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+            if page in marked:
+                self._paint_marks(painter, page, rect, shown)
             if page in highlighted:
                 self._paint_bands(painter, page, rect, shown)
         painter.end()
@@ -1014,6 +1094,29 @@ class PageView(ReaderView, QAbstractScrollArea):
                 painter.setBrush(QColor(0, 0, 0, alpha))
                 painter.drawRoundedRect(rect.adjusted(-spread, -spread + 1, spread, spread + 1), spread, spread)
         painter.setBrush(Qt.BrushStyle.NoBrush)
+
+    def _paint_marks(self, painter: QPainter, page: int, rect: QRectF, shown: _Entry | None) -> None:
+        """The reader's highlights (multiplied on, like a highlighter pen) and the selection."""
+        painter.save()
+        painter.setClipRect(rect)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        light = shown is None or not shown.toned or not self._theme.dark
+        painter.setCompositionMode(
+            QPainter.CompositionMode.CompositionMode_Multiply if light else QPainter.CompositionMode.CompositionMode_Screen
+        )
+        for band, color in self._mark_bands:
+            if band.page == page:
+                fill = QColor(color)
+                if not light:
+                    fill = fill.darker(220)
+                painter.fillRect(self.map_box(page, band.box), fill)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+        selection = QColor(themes.selection_color(self._theme))
+        selection.setAlphaF(0.55)
+        for band in self._selection_bands:
+            if band.page == page:
+                painter.fillRect(self.map_box(page, band.box), selection)
+        painter.restore()
 
     def _paint_bands(self, painter: QPainter, page: int, rect: QRectF, shown: _Entry | None) -> None:
         path = QPainterPath()

@@ -204,6 +204,11 @@ def reading_font(size: float, weight: QFont.Weight = QFont.Weight.Normal, family
     return font
 
 
+def selection_color(t: Theme) -> str:
+    """Text selected with the mouse: the system's blue, never the reading highlight's color."""
+    return "#3F638B" if t.dark else "#B3D7FF"
+
+
 def tooltip_stylesheet(t: Theme) -> str:
     """Small, thin tooltips like macOS's own. Tooltips are separate windows, so
     this goes on the application rather than the main window."""
@@ -247,7 +252,7 @@ QStatusBar QLabel {{ color: {on_chrome_soft}; }}
 QStatusBar::item {{ border: none; }}
 
 QTextEdit#readerView {{ background: {t.page}; color: {t.text}; border: none;
-           selection-background-color: {t.highlight}; selection-color: {t.text}; }}
+           selection-background-color: {selection_color(t)}; selection-color: {t.text}; }}
 QAbstractScrollArea#pageView {{ background: {t.page}; border: none; }}
 
 QPushButton {{ background: {t.raised}; color: {t.text}; border: 1px solid {t.line};

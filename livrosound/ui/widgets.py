@@ -72,6 +72,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QStyle,
     QStyledItemDelegate,
@@ -83,7 +84,7 @@ from PySide6.QtWidgets import (
 
 from ..paths import ICONS_DIR
 from . import theme as themes
-from .theme import ACCENT, ACCENT_HOVER, ON_ACCENT, PROGRESS_BLUES, READING_FAMILIES, THEMES, ui_font
+from .theme import ACCENT, ACCENT_HOVER, ON_ACCENT, PROGRESS_BLUES, READING_FAMILIES, THEMES, reading_font, ui_font
 
 APP_ICON = ICONS_DIR / "livrosound.svg"
 BOOK_BOUNDS = QRectF(28, 104, 456, 306)  # the book's outline inside the icon's 512 × 512 view box
@@ -1357,3 +1358,208 @@ def inform(parent: QWidget | None, title: str, text: str) -> None:
     ok = alert.add_button("OK", "primaryButton", accept=True)
     ok.setDefault(True)
     alert.exec()
+
+
+# ---------- find, notes and look up ----------
+
+
+def color_icon(color: str, size: int = 14) -> QIcon:
+    """A round swatch of a highlighter color, for menus."""
+    pixmap, p = _canvas(size, size)
+    p.setPen(QPen(QColor(0, 0, 0, 60), 1))
+    p.setBrush(QColor(color))
+    p.drawEllipse(QRectF(1, 1, size - 2, size - 2))
+    p.end()
+    return QIcon(pixmap)
+
+
+class FindBar(QFrame):
+    """Find in the book (⌘F): a search field, "3 of 27", ‹ › and Done, floating at the
+    top right of the page. Typing searches after a short pause."""
+
+    query_changed = Signal(str)
+    step = Signal(int)  # -1 previous, +1 next match
+    closed = Signal()
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("findBar")
+        row = QHBoxLayout(self)
+        row.setContentsMargins(10, 6, 8, 6)
+        row.setSpacing(6)
+        self.field = QLineEdit()
+        self.field.setObjectName("librarySearch")
+        self.field.setPlaceholderText("Find in book")
+        self.field.setClearButtonEnabled(True)
+        self.field.setFixedWidth(240)
+        self.field.setFixedHeight(30)
+        self.field.returnPressed.connect(lambda: self.step.emit(1))
+        self.count = QLabel("")
+        self.count.setObjectName("caption")
+        self.count.setFont(ui_font(12))
+        self.count.setMinimumWidth(64)
+        row.addWidget(self.field)
+        row.addWidget(self.count)
+        self.buttons = []
+        for text, tip, value in (("‹", "Previous match (⇧⌘G)", -1), ("›", "Next match (⌘G)", 1)):
+            button = QToolButton()
+            button.setObjectName("libraryTool")
+            button.setText(text)
+            button.setToolTip(tip)
+            button.setFont(ui_font(16, QFont.Weight.Medium))
+            button.setFixedSize(30, 30)
+            button.clicked.connect(lambda _=False, v=value: self.step.emit(v))
+            row.addWidget(button)
+            self.buttons.append(button)
+        done = QToolButton()
+        done.setObjectName("libraryTool")
+        done.setText("Done")
+        done.clicked.connect(self.close_bar)
+        row.addWidget(done)
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(220)
+        self._timer.timeout.connect(lambda: self.query_changed.emit(self.field.text()))
+        self.field.textChanged.connect(lambda _t: self._timer.start())
+        self.hide()
+
+    def open(self) -> None:
+        self.show()
+        self.raise_()
+        self.field.setFocus()
+        self.field.selectAll()
+
+    def close_bar(self) -> None:
+        self.hide()
+        self.closed.emit()
+
+    def set_count(self, index: int, total: int, capped: bool = False) -> None:
+        if not self.field.text().strip():
+            self.count.setText("")
+        elif not total:
+            self.count.setText("Not found")
+        else:
+            self.count.setText(f"{index + 1} of {total}{'+' if capped else ''}")
+        for button in self.buttons:
+            button.setEnabled(total > 1)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self.close_bar()
+            return
+        super().keyPressEvent(event)
+
+    def paintEvent(self, event):
+        t = themes.current()
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(QPen(QColor(t.line), 1))
+        p.setBrush(QColor(t.panel))
+        p.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 12, 12)
+
+
+class NotesPopover(Popover):
+    """The reader's highlights and notes in this book, in reading order; clicking one
+    goes there. Each entry: (id, color, excerpt, note, chapter)."""
+
+    picked = Signal(str)
+    WIDTH = 380
+
+    def __init__(self, parent: QWidget | None, entries: list[tuple[str, str, str, str, str]]):
+        super().__init__(parent, width=self.WIDTH + 24)
+        self.body.addWidget(_popover_title("Highlights & Notes"))
+        self.body.addWidget(_hairline())
+        if not entries:
+            empty = QLabel("Select text in the book to highlight it or add a note.")
+            empty.setObjectName("caption")
+            empty.setWordWrap(True)
+            empty.setFont(ui_font(13))
+            self.body.addWidget(empty)
+            self.list = None
+            return
+        self.list = _popover_list(self.WIDTH)
+        for item_id, color, excerpt, note, chapter in entries:
+            row = QWidget()
+            layout = QHBoxLayout(row)
+            layout.setContentsMargins(8, 6, 8, 6)
+            bar = QFrame()
+            bar.setFixedWidth(4)
+            bar.setStyleSheet(f"background: {color}; border-radius: 2px;")
+            layout.addWidget(bar)
+            texts = QVBoxLayout()
+            texts.setSpacing(2)
+            quote = QLabel(QFontMetrics(ui_font(13)).elidedText(" ".join(excerpt.split()), Qt.TextElideMode.ElideRight,
+                                                                 2 * (self.WIDTH - 60)))
+            quote.setWordWrap(True)
+            quote.setFont(reading_font(13))
+            texts.addWidget(quote)
+            if note:
+                label = QLabel(note)
+                label.setWordWrap(True)
+                label.setFont(ui_font(12, QFont.Weight.Medium))
+                texts.addWidget(label)
+            if chapter:
+                where = QLabel(chapter)
+                where.setObjectName("caption")
+                where.setFont(ui_font(11))
+                texts.addWidget(where)
+            layout.addLayout(texts, 1)
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, item_id)
+            row.setFixedWidth(self.WIDTH - 8)
+            row.adjustSize()
+            item.setSizeHint(QSize(self.WIDTH - 8, row.sizeHint().height()))
+            self.list.addItem(item)
+            self.list.setItemWidget(item, row)
+        self.list.setFixedHeight(min(460, sum(self.list.sizeHintForRow(i) + 2 for i in range(self.list.count())) + 6))
+        self.list.itemClicked.connect(lambda item: (self.picked.emit(item.data(Qt.ItemDataRole.UserRole)), self.close()))
+        self.body.addWidget(self.list)
+
+
+class DefinitionPopover(Popover):
+    """Look Up: the word, its definition from the Mac's own dictionary (New Oxford
+    American), and links to the Dictionary app, Merriam-Webster and Oxford online."""
+
+    open_url = Signal(str)
+
+    def __init__(self, parent: QWidget | None, word: str, definition: str | None,
+                 links: list[tuple[str, str, str]]):
+        super().__init__(parent, arrow=False, width=420)
+        title = QLabel(word)
+        title.setFont(reading_font(20, QFont.Weight.DemiBold))
+        self.body.addWidget(title)
+        text = QLabel(definition or "This Mac's dictionary has no entry for this word. Try a dictionary below.")
+        text.setWordWrap(True)
+        text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        text.setFont(ui_font(13))
+        text.setObjectName("" if definition else "caption")
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(text)
+        scroll.setFixedHeight(min(320, max(60, text.sizeHint().height() + 12 if not definition else 300)))
+        self.definition = text
+        self.body.addWidget(scroll)
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        self.link_buttons = []
+        for label, url, tip in links:
+            button = QPushButton(label)
+            button.setObjectName("secondaryButton")
+            button.setFixedHeight(30)
+            button.setToolTip(tip)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.clicked.connect(lambda _=False, u=url: self.open_url.emit(u))
+            row.addWidget(button)
+            self.link_buttons.append(button)
+        self.body.addLayout(row)
+
+    def popup_at(self, point: QPoint) -> None:
+        self.adjustSize()
+        screen = (self.screen()).availableGeometry()
+        x = max(screen.left() + 8, min(point.x() - self.width() // 2, screen.right() - self.width() - 8))
+        y = point.y() + 14
+        if y + self.height() > screen.bottom() - 8:
+            y = max(screen.top() + 8, point.y() - self.height() - 14)
+        self.move(x, y)
+        self.show()
