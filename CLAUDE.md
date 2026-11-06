@@ -18,7 +18,7 @@ is **read-only** from here: copy and adapt, never modify it.
 - Run the app: `uv run main.py`
 - Set up / repair the venv: `uv sync` (Python 3.12, uv, `.venv/`). The only extra is
   `--extra validate` (the Whisper check). Don't `uv add` / `pip install` without asking.
-- Tests: `uv run pytest` — 883 fast tests, no models (`addopts = -m 'not slow'`).
+- Tests: `uv run pytest` — ~840 fast tests, no models (`addopts = -m 'not slow'`).
   Real-model / real-book tests (25): `uv run pytest -m slow tests/<file> -q`.
 - `tests/conftest.py` gives every test its own `LIVROSOUND_CACHE` (never the user's
   library) and offscreen Qt (`qapp` fixture). Fakes: `tests/fakes.py` `FakeEngine`;
@@ -115,10 +115,17 @@ Fusion, `ui_font(13)`, `ensure_reading_fonts()`, Dock icon, `MainWindow()`):
   Highlight), `ContentsPopover` (fern dot = audio ready, `set_ready`), `VoicePicker` /
   `VoiceMenu`, `VoicePreviews`, `PlayerCapsule` (−10 sec, ⏮, ▶, ⏭, +10 sec),
   `GradientProgressBar`, `ToggleSwitch`, `Alert`, `confirm()`, `inform()`.
-- `landing.py` — `LivroSoundLanding`: Upload New Book / Resume a Previous Book.
+- `landing.py` — `LivroSoundLanding`: Upload New Book / Go to Library.
+- `library_page.py` — `LibraryPage` + `BookShelf` (painted covers grid/list, sections, Select
+  mode, ⋯ View/Group/Sort menu, ☰ app menu); ordering/grouping in `livrosound/shelf.py`, covers
+  and book info in `livrosound/bookinfo.py`.
+- `audio_pages.py` — `GenerationPage` (audio-generation only), `PlayerPage` (audio player only),
+  `ChapterBar`.
+- `fonts.py` — user fonts (Add Font…) in `cache/fonts/`.
 - `dialogs.py` — `ImportProgressDialog`, `LayoutDialog`, `ChooseVoiceDialog`
   (`ask(parent, engine, voice, …) -> voice | None`), `CustomizeAudioDialog`,
-  `LibraryDialog` (`on_remove`); each has `ask(...)`.
+  `BookDetailsDialog`, `SettingsDialog` (tabs, live `changed(field)`), `ChapterExportDialog`;
+  each has `ask(...)`.
 - `reader_view.py` — the `ReaderView` mixin both views share (clicked, user_scrolled,
   auto-follow helpers, link cursor); `ensure_reading_fonts()`.
 - `reflow_view.py` — `ReflowView` (QTextEdit): LivroSound layout of any book, and the
@@ -166,8 +173,12 @@ Assets: `assets/voices/` (17 voices + `voices.json` + README), `assets/icons/`
 - **Layouts:** Original (PDF pages like Preview's continuous scroll, zoomed in, with a
   highlight band; EPUB/DOCX/TXT with their own HTML) or LivroSound (Apple-Books-like,
   Iowan / New York).
-- **Landing:** Upload New Book / Resume a Previous Book; resume restores the position.
-- **Export MP3** with chapters at 100%.
+- **Landing:** Upload New Book / Go to Library (covers, group/sort/search, tags, collections);
+  opening a book restores the position.
+- **Export MP3 or M4B** with chapters at 100%; **Export Chapters** makes and saves chosen chapters.
+- **Aaron and Ana at the top** of the voice list (Recommended); Aaron is the default.
+- The 2026-11-05 additions (Readest-style settings, page views, highlighter units, notes,
+  Look Up, Find, e-reader mode, generation-only and player-only modes): DESIGN.md "Additions".
 
 ## Conventions
 
@@ -223,10 +234,13 @@ Assets: `assets/voices/` (17 voices + `voices.json` + README), `assets/icons/`
 - If git complains about `.git/index.lock`: `rm -f .git/index.lock`. Don't commit large
   binary art; voices are the exception (they ship with the code).
 
-## Current state & ideas (2026-10-23)
+## Current state & ideas (2026-11-05)
 
-- Feature-complete for PDF (digital), EPUB, DOCX, TXT with Pocket-TTS; 883 fast tests
-  green. Nothing is committed yet (`master` has no commits).
+- Feature-complete for PDF (digital), EPUB, DOCX, TXT with Pocket-TTS; fast tests green.
+  2026-11-05: library page, Readest-style settings, page views, notes, Look Up, Find,
+  e-reader mode, M4B and chapter export, generation-only and player-only modes (branch
+  `claude/cool-ramanujan-vumjov`). Not tested on a Mac yet: Look Up (DictionaryServices),
+  KeepAwake (App Nap), Finder FileOpen events, and the look of Iowan in the new views.
 - **Scanned books and OmniVoice were removed** (user decisions). The OCR-capable code
   (`ingest/ocr.py` with PaddleOCR PP-OCRv6, `ImportDialog`, `ImportOptions`, the
   `ocr`/`omnivoice` extras, `engines/omnivoice.py`) is saved in

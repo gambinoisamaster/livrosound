@@ -125,12 +125,14 @@ and no voice is louder than another.
 
 ### Coming back
 
-- **Resume a Previous Book** lists your books with how much you've read, how
-  much audio is ready and when you last opened them. A book reopens at the
-  sentence where you stopped, highlighted and centered. If its audio wasn't
-  finished, LivroSound asks *"Continue generating audio?"* and carries on from
-  where you are. Right-click a book to remove it (its text and audio are
-  deleted from LivroSound; your file stays where it is).
+- **Go to Library** shows every book as its cover (or in a list), with how
+  much you've read and how much audio is ready. Search, group them (authors,
+  tags, subjects, collections, series, status) and sort them (title, author,
+  format, pages, series, date read, date added, date published, progress, time
+  remaining). Select books to open, tag, put into collections or remove; Details
+  edits a book's tags and collections. A book reopens at the sentence where you
+  stopped. If its audio wasn't finished, LivroSound asks *"Continue generating
+  audio?"*.
 - Opening a file you've opened before asks *"You've opened this book before.
   Pick up where you left off?"*
 - If you've moved a PDF, open it from its new place and its pages come back
@@ -140,7 +142,7 @@ and no voice is louder than another.
 
 ### Export
 
-When the audio reaches 100%, **Export MP3** takes the progress bar's place. It
+When the audio reaches 100%, **Export MP3** (or **Export M4B**, an audiobook like Audible's) takes the progress bar's place; **Audio ▸ Export Chapters…** saves chosen chapters as files of their own, making only their audio first. It
 saves the whole book as one MP3 with the title and author filled in and a
 chapter marker for every chapter in the contents, so Apple Books, podcast
 apps and car stereos can skip between chapters. It's fast (a 10-hour book in
@@ -279,3 +281,20 @@ the design and module contract; `CLAUDE.md` is the map of the code.
   ship with macOS; LivroSound uses them but doesn't include them.
 - **The narrator voices** were recorded and cloned by the user, from Script
   Radio's voice library.
+
+## Reading and listening, your way (Readest-style settings)
+
+- **Settings** (⌘,): your font (or one you add), weight and size; line, paragraph,
+  word and letter spacing; justified text; left and right margins and the widest
+  column; continuous scroll, single page or double page; your own paper and text
+  colors; Auto Mode (follows macOS Light/Dark); page numbers and % read.
+- **Highlighter**: word by word, sentence by sentence or paragraph by paragraph.
+- **Select text** to highlight it (five colors), add a note, copy it, look a word up
+  (the Mac's own dictionary offline; Merriam-Webster and Oxford online) or find it.
+  **Notes** lists your highlights. **⌘F** finds anything in the book.
+- **Read books aloud** off (Settings ▸ Reading) makes LivroSound an e-reader only.
+- **Audio ▸ Audio-Generation Only** makes the audio with nothing else on screen and
+  can save the MP3, M4B or chapters by itself at the end; the time left is shown
+  for both modes. **Audio ▸ Audio Player Only** shows just the cover, the chapter
+  and the player.
+

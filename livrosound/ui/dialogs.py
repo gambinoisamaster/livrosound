@@ -55,6 +55,8 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QPushButton,
     QScrollArea,
     QSlider,
@@ -1148,3 +1150,118 @@ def _pick_color(current: str, title: str) -> str | None:
 
     color = QColorDialog.getColor(QColor(current), None, title)
     return color.name() if color.isValid() else None
+
+
+# ---------- Export Chapters ----------
+
+
+class ChapterExportDialog(_Dialog):
+    """Pick chapters to save as files of their own (MP3 or M4B, into a folder).
+    Chapters whose audio isn't made yet are made first, and each is saved as soon
+    as it's done, so the first ones can be heard before the rest is ready.
+    Each chapter: (title, length text, ready)."""
+
+    def __init__(self, parent: QWidget | None, chapters: list[tuple[str, str, bool]], fmt: str, folder: str,
+                 eta: Callable[[list[int]], str] | None = None, choose_folder: Callable[[str], str] | None = None):
+        super().__init__(parent, "Export Chapters", "Each chapter becomes its own audio file.")
+        self.setMinimumSize(560, 560)
+        self._eta = eta
+        self._choose_folder = choose_folder or _choose_folder
+        self.folder = folder
+        from .widgets import segmented_control
+
+        self.list = QListWidget()
+        self.list.setObjectName("popoverList")
+        self.list.setFrameShape(QFrame.Shape.NoFrame)
+        for title, length, ready in chapters:
+            item = QListWidgetItem(f"{title}\n{length} · {'ready' if ready else 'not made yet'}")
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Unchecked)
+            item.setFont(ui_font(13))
+            self.list.addItem(item)
+        self.list.itemChanged.connect(lambda _item: self._update())
+        card = QFrame()
+        card.setObjectName("card")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(6, 6, 6, 6)
+        card_layout.addWidget(self.list)
+        self.body.addWidget(card, 1)
+        row = QHBoxLayout()
+        self.all_button = _button("Select All", "secondaryButton")
+        self.all_button.clicked.connect(self._select_all)
+        row.addWidget(self.all_button)
+        row.addStretch(1)
+        self.fmt = fmt
+        frame, self.format_buttons = segmented_control(
+            [("mp3", "MP3", "Plays everywhere"), ("m4b", "M4B", "An audiobook, like Audible's")], fmt,
+            self._set_format, self,
+        )
+        frame.setFixedWidth(200)
+        row.addWidget(frame)
+        self.body.addLayout(row)
+        folder_row = QHBoxLayout()
+        self.folder_label = _hint("", 12)
+        folder_row.addWidget(self.folder_label, 1)
+        change = _button("Choose Folder…", "secondaryButton")
+        change.clicked.connect(self._change_folder)
+        folder_row.addWidget(change)
+        self.body.addLayout(folder_row)
+        self.summary = _hint("", 12)
+        self.body.addWidget(self.summary)
+        self.cancel_button = _button("Cancel", "goBackButton")
+        self.cancel_button.clicked.connect(self.reject)
+        self.export_button = _button("Export", "generateAudioButton", default=True)
+        self.export_button.clicked.connect(self.accept)
+        self._add_buttons(self.cancel_button, self.export_button)
+        self._ready = [r for _, _, r in chapters]
+        self._update()
+
+    def chosen(self) -> list[int]:
+        return [i for i in range(self.list.count()) if self.list.item(i).checkState() == Qt.CheckState.Checked]
+
+    def _select_all(self) -> None:
+        on = len(self.chosen()) < self.list.count()
+        for i in range(self.list.count()):
+            self.list.item(i).setCheckState(Qt.CheckState.Checked if on else Qt.CheckState.Unchecked)
+
+    def _set_format(self, fmt: str) -> None:
+        self.fmt = fmt
+
+    def _change_folder(self) -> None:
+        folder = self._choose_folder(self.folder)
+        if folder:
+            self.folder = folder
+            self._update()
+
+    def _update(self) -> None:
+        chosen = self.chosen()
+        self.folder_label.setText(f"Saved in {self.folder}")
+        missing = [i for i in chosen if not self._ready[i]]
+        self.export_button.setEnabled(bool(chosen))
+        self.export_button.setText("Generate & Export" if missing else "Export")
+        if not chosen:
+            self.summary.setText("Tick the chapters you want.")
+        elif missing:
+            eta = self._eta(missing) if self._eta else ""
+            self.summary.setText(
+                f"{len(missing)} of them still need their audio made{f' ({eta})' if eta else ''}; "
+                "each is saved as soon as it's ready."
+            )
+        else:
+            self.summary.setText(f"{len(chosen)} chapter{'' if len(chosen) == 1 else 's'} ready to save.")
+        self.all_button.setText("Select None" if chosen and len(chosen) == self.list.count() else "Select All")
+
+    @classmethod
+    def ask(cls, parent: QWidget | None, chapters: list[tuple[str, str, bool]], fmt: str, folder: str,
+            **kwargs) -> tuple[list[int], str, str] | None:
+        """(chosen chapter indices, "mp3" | "m4b", folder), or None (Cancel)."""
+        dialog = cls(parent, chapters, fmt, folder, **kwargs)
+        if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.chosen():
+            return None
+        return dialog.chosen(), dialog.fmt, dialog.folder
+
+
+def _choose_folder(current: str) -> str:
+    from PySide6.QtWidgets import QFileDialog
+
+    return QFileDialog.getExistingDirectory(None, "Save Chapters In", current)

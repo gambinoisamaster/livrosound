@@ -1518,3 +1518,116 @@ def window_book_id(path: Path) -> str:
     from livrosound.ingest import book_id_for
 
     return book_id_for(path)
+
+
+# ---------- M4B, chapters, generation only, player only ----------
+
+
+def test_export_m4b_with_chapters(script, tmp_path):
+    window, _, _ = script.window()
+    script.answers["Generate audio from the beginning?"] = True
+    open_book(script, window, write_txt(tmp_path))
+    wait_until(lambda: window._worker is None)
+    assert window.export_actions["m4b"].isEnabled() and window.export_more.isVisible()
+    script.save_as = str(tmp_path / "Rain")
+    window.export_actions["m4b"].trigger()
+    wait_until(lambda: window._export is None, what="the export")
+    info = ffprobe(tmp_path / "Rain.m4b")
+    assert info["chapters"] and info["format"]["format_name"].startswith("mov")
+    assert window.export_button.text() == "Export M4B"  # remembered
+
+
+def _chapter_book(tmp_path: Path) -> Path:
+    path = tmp_path / "chapters.txt"
+    parts = ["THREE CHAPTERS", "by Someone"]
+    for n in ("ONE", "TWO", "THREE"):
+        parts.append(f"CHAPTER {n}")
+        parts += [f"Paragraph {i} of chapter {n.lower()}, with words to read." for i in range(4)]
+    path.write_text("\n\n".join(parts))
+    return path
+
+
+def test_export_chapters_makes_only_those_and_saves_each(script, tmp_path, monkeypatch):
+    window, _, engine = script.window()
+    script.voice = None
+    open_book(script, window, _chapter_book(tmp_path))
+    chapters = mw.export.chapter_blocks(window.book, window.order)
+    assert len(chapters) == 3
+    folder = tmp_path / "out"
+    seen = {}
+
+    def ask(parent, rows, fmt, folder_default, **kwargs):
+        seen["rows"], seen["eta"] = rows, kwargs["eta"]([1])
+        return [1], "mp3", str(folder)
+
+    monkeypatch.setattr(dialogs.ChapterExportDialog, "ask", ask)
+    script.voice = "Aaron"
+    window.export_actions["chapters"].trigger()
+    assert [title for title, _, _ in seen["rows"]] == [c[1] for c in chapters] and seen["eta"].startswith("about")
+    wait_until(lambda: (folder / mw.export.chapter_file_name(2, chapters[1][1], "mp3")).exists()
+               and window._export is None and window._worker is None, what="chapter two's file")
+    made = window.store.generated()
+    assert set(chapters[1][2]) <= made and not set(chapters[2][2]) & made  # only what was chosen
+    assert "Saved “02 - " in window.statusBar().currentMessage()
+
+
+def test_generation_only_mode_makes_the_audio_and_saves_it(script, tmp_path, monkeypatch):
+    window, _, engine = script.window()
+    script.voice = None
+    open_book(script, window, write_txt(tmp_path))
+    monkeypatch.setattr(mw.Path, "home", lambda: tmp_path)
+    engine.hold()
+    script.voice = "Aaron"
+    window.generation_only_action.trigger()
+    assert window.pages.currentWidget() is window.generation_page and window._generation_only
+    assert window._worker is not None and window.view is not None
+    page = window.generation_page
+    assert page.stop_button.isVisible() or not page.stop_button.isHidden()
+    next(b for k, b in page.after_buttons.items() if k == "m4b").click()
+    assert window._after_generation == "m4b"
+    text = window.eta_text()
+    assert text.startswith("About ") and "with the book on screen" in text
+    engine.release()
+    wait_until(lambda: (tmp_path / "Music" / "The Long Rain.m4b").exists() and window._export is None,
+               what="the M4B saved at 100%")
+    assert page.headline.text() == "All the audio is ready"
+    page.back_requested.emit()
+    assert window.pages.currentWidget() is window.reader_page and not window._generation_only
+
+
+def test_player_only_page_follows_the_listening(script, tmp_path):
+    window, outputs, _ = script.window()
+    script.answers["Generate audio from the beginning?"] = True
+    open_book(script, window, _chapter_book(tmp_path))
+    wait_until(lambda: window._worker is None)
+    window.player_button.click()
+    page = window.player_page
+    assert window.pages.currentWidget() is page and len(window._player_chapters) == 3
+    window.toggle_play()
+    play(window, outputs, 1500)
+    window._refresh_audio_pages()
+    assert page.chapter_title.text() == window._player_chapters[0][1]
+    assert page.left_in_book.text().endswith("left in book") and page.remaining.text().startswith("-")
+    lengths = page.chapter_bar._lengths
+    assert len(lengths) == 3 and all(x > 0 for x in lengths)
+    window.toggle_play()
+    page.chapter_requested.emit(2)
+    wait(50)
+    assert window.player.position()[0] == window._player_chapters[2][2][0]
+    page.seek_requested.emit(0.5)
+    block = window.player.position()[0]
+    assert block in window._player_chapters[2][2]
+    page.show_text_requested.emit()
+    assert window.pages.currentWidget() is window.reader_page
+
+
+def test_time_estimates_use_what_this_mac_measured(script, tmp_path):
+    window, _, engine = script.window()
+    script.voice = None
+    open_book(script, window, write_txt(tmp_path))
+    window.settings.rate_normal = 30.0
+    chars = window.remaining_chars()
+    assert chars == sum(window.weights.values())
+    text = window.eta_text()
+    assert text.startswith("The rest takes about ") and "audio-generation only mode" in text
+    assert mw.estimate.duration_text(chars / 30.0) in text
