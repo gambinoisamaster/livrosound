@@ -206,7 +206,10 @@ class BookShelf(QAbstractScrollArea):
         self.setObjectName("bookShelf")
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        # Always there: a bar that comes and goes changes the shelf's width, which changes how
+        # many covers fit a row, which changes whether the bar is needed — the covers would
+        # jump back and forth for ever.
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         self.viewport().setMouseTracking(True)
         self.covers = CoverCache()
         self._sections: list[tuple[str, list[BookRecord]]] = []

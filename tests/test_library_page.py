@@ -163,3 +163,30 @@ def test_right_click_opens_the_books_menu(page, monkeypatch):
     QTest.mouseClick(page.shelf.viewport(), Qt.MouseButton.RightButton, pos=page.shelf.item_rect("b3").center())
     assert asked == ["b3"]
     QTest.mouseClick(page.shelf.viewport(), Qt.MouseButton.LeftButton, pos=QPoint(2, 2))  # nothing there
+
+
+def test_the_shelf_settles_instead_of_shaking(host, qapp):
+    """Bug: a scroll bar that came and went changed how many covers fit a row, which
+    changed whether the bar was needed: the covers jumped back and forth for ever."""
+    from PySide6.QtCore import QEventLoop, QTimer
+
+    from livrosound.ui.library_page import BookShelf
+
+    lib = Library([BookRecord(f"b{i}", f"Book {i}", "A", f"/x/{i}", "epub") for i in range(7)])
+    calls = []
+    real = BookShelf._relayout
+    BookShelf._relayout = lambda self: (calls.append(1), real(self))[1]
+    try:
+        for width in range(960, 1030, 7):
+            page = LibraryPage(lib, Settings())  # a window of its own, laid out like the real one
+            page.resize(width, 700)
+            page.show()
+            calls.clear()
+            loop = QEventLoop()
+            QTimer.singleShot(60, loop.quit)
+            loop.exec()
+            assert len(calls) <= 3, f"{len(calls)} relayouts at {width}×700"
+            page.close()
+            page.deleteLater()
+    finally:
+        BookShelf._relayout = real
