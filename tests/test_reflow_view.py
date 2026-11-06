@@ -520,7 +520,8 @@ def test_narrow_and_wide_windows_keep_a_centered_column(qapp):
     book = _sample_book()
     view = _view(qapp, book, size=(1400, 700))
     viewport = view.viewport().geometry()
-    assert viewport.width() == 700
+    bar = view.verticalScrollBar().sizeHint().width()
+    assert viewport.width() == int((1400 - bar) * 0.85)  # 85% of the window by default
     assert abs(viewport.left() - (view.width() - viewport.right())) < 30
     view.resize(500, 700)
     qapp.processEvents()
@@ -769,24 +770,28 @@ def test_margins_and_column_width(qapp):
     from livrosound.ui.reader_view import ReadingStyle
 
     view = _view(qapp, _sample_book(), size=(1200, 700))
-    view.set_style(ReadingStyle(max_column=500))
-    assert view._column == 500
+    bar = view.verticalScrollBar().sizeHint().width()
+    view.set_style(ReadingStyle(width=50))
+    assert view._column == int((1200 - bar) * 0.5)
     margins = view.viewportMargins()
-    assert abs(margins.left() - margins.right()) <= view.verticalScrollBar().sizeHint().width() + 1  # centered
-    view.set_style(ReadingStyle(margin_left=40, margin_right=400, max_column=2000))
+    assert abs(margins.left() - margins.right()) <= bar + 1  # centered
+    view.set_style(ReadingStyle(margin_left=40, margin_right=400))
     margins = view.viewportMargins()
     assert margins.left() == 40 and margins.right() >= 400
-    assert view._column == 1200 - view.verticalScrollBar().sizeHint().width() - 440
+    assert view._column == 1200 - bar - 440
     view.close()
 
 
-def test_single_page_turns_whole_pages_and_follows_the_reading(qapp):
-    view = _view(qapp, _long_book(), size=(800, 600))
+def test_single_page_is_a_sheet_on_paper_and_turns_whole_pages(qapp):
+    view = _view(qapp, _long_book(), size=(1000, 700))
     view.set_page_mode("single")
     qapp.processEvents()
-    assert view.verticalScrollBar().isHidden() or view.verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-    height = view.viewport().height()
+    assert view.verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+    [sheet] = view._sheets
+    assert sheet.height() > 600 and sheet.width() < sheet.height() and abs(sheet.center().x() - 500) < 2
+    height = view._page_height
     assert view.document().pageSize().height() == height and view.spread_step() == height
+    assert view._column < sheet.width()  # the text sits inside the sheet
     assert view.verticalScrollBar().value() == 0
     view.page_step(1)
     assert view.verticalScrollBar().value() == height
@@ -794,7 +799,6 @@ def test_single_page_turns_whole_pages_and_follows_the_reading(qapp):
     assert view.verticalScrollBar().value() == 2 * height
     QTest.keyClick(view, Qt.Key.Key_Up)
     assert view.verticalScrollBar().value() == height
-    assert view.page_info() is None  # not counted yet
     total = view.count_pages()
     assert total > 5 and view.page_info() == (2, 2, total)
     # Auto-follow turns to the page with the sentence rather than scrolling.
@@ -803,7 +807,6 @@ def test_single_page_turns_whole_pages_and_follows_the_reading(qapp):
     view.keep_in_view(last, 0, 10)
     assert view.verticalScrollBar().value() % height == 0
     assert view._page_of(view._doc_pos(last, 0)) in view._pages_shown()
-    QTest.keyClick(view, Qt.Key.Key_End)
     QTest.keyClick(view, Qt.Key.Key_Home)
     assert view.verticalScrollBar().value() == 0
     # No line is cut by a page edge.
@@ -816,37 +819,44 @@ def test_single_page_turns_whole_pages_and_follows_the_reading(qapp):
             top = rect.top() + lines.lineAt(i).y()
             assert int(top // height) == int((top + lines.lineAt(i).height() - 0.01) // height)
         block = block.next()
+    # The paper around the sheet is drawn, and the page number at the bottom right.
+    image = view.viewport().grab().toImage()
+    assert image.pixelColor(5, 350) != QColor(themes.current().page)
+    assert view._running_head() == "Long"  # no contents: the book's title
     view.close()
 
 
-def test_double_page_paints_two_pages_and_clicks_the_right_one(qapp):
-    view = _view(qapp, _long_book(), size=(1200, 700))
+def test_double_page_paints_two_sheets_and_clicks_the_right_one(qapp):
+    view = _view(qapp, _long_book(), size=(1400, 800))
     view.set_page_mode("double")
     qapp.processEvents()
-    height = view.viewport().height()
+    left_sheet, right_sheet = view._sheets
+    assert left_sheet.right() == right_sheet.left()  # they meet at the spine
+    height = view._page_height
     assert view.spread_step() == 2 * height
-    assert view.viewport().width() == 2 * view._column + 64
     view.page_step(1)
     assert view.verticalScrollBar().value() == 2 * height
-    first, last, total = view.page_info() if view.count_pages() else (0, 0, 0)
+    view.count_pages()
+    first, last, _ = view.page_info()
     assert (first, last) == (3, 4)
-    # A click on the right page lands on the text of page 4.
     clicks = []
     view.clicked.connect(lambda block, char: clicks.append((block, char)))
-    point = QPoint(view._column + 64 + view._column // 2, 120)
-    QTest.mouseClick(view.viewport(), Qt.MouseButton.LeftButton, pos=point)
+    right = view._origins[1]
+    QTest.mouseClick(view.viewport(), Qt.MouseButton.LeftButton,
+                     pos=QPoint(int(right.x() + view._column / 2), int(right.y() + 60)))
     assert clicks and view._page_of(view._doc_pos(*clicks[0])) == 3
-    left = QPoint(view._column // 2, 120)
-    QTest.mouseClick(view.viewport(), Qt.MouseButton.LeftButton, pos=left)
+    left = view._origins[0]
+    QTest.mouseClick(view.viewport(), Qt.MouseButton.LeftButton,
+                     pos=QPoint(int(left.x() + view._column / 2), int(left.y() + 60)))
     assert view._page_of(view._doc_pos(*clicks[1])) == 2
-    # Both pages are painted.
     image = view.viewport().grab().toImage()
     page = QColor(themes.current().page)
 
-    def inked(x0: int, x1: int) -> bool:
-        return any(image.pixelColor(x, y) != page for x in range(x0, x1, 3) for y in range(60, height - 120, 7))
+    def inked(sheet) -> bool:
+        x0, x1 = int(sheet.left() + 40), int(sheet.right() - 40)
+        return any(image.pixelColor(x, y) != page for x in range(x0, x1, 3) for y in range(100, height - 40, 7))
 
-    assert inked(0, view._column) and inked(view._column + 64, 2 * view._column + 64)
+    assert inked(left_sheet) and inked(right_sheet)
     view.set_page_mode("scroll")
     assert view.document().pageSize().height() < 0 and view.viewportMargins().left() > 0
     view.close()

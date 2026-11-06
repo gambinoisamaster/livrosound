@@ -181,7 +181,8 @@ def test_unreadable_library_is_empty(content):
 
 def test_book_record_defaults_match_contract():
     r = BookRecord("id", "t", "a", "/p", "pdf")
-    assert (r.layout, r.engine, r.voice, r.audio_signature) == ("livrosound", "", "", "")
+    assert (r.layout, r.engine, r.voice, r.audio_signature) == ("", "", "", "")  # "": follow the default
+    assert (r.style, r.auto_export) == ({}, {})
     assert (r.position_block, r.position_ms, r.last_opened) == (0, 0, "")
     assert (r.generated_fraction, r.generation_start) == (0.0, -1)
     assert not hasattr(r, "ocr")  # scanned books (OCR) aren't supported

@@ -57,14 +57,15 @@ def host(qapp):
 
 
 def test_themes_popover_reports_every_choice(host):
-    pop = w.ThemesPopover(host, "original", layout="original", highlight=True)
+    pop = w.ThemesPopover(host, "original", override=False, highlight=True, page_view="single")
     themes_seen = _recorder(pop.theme_chosen)
     sizes = _recorder(pop.text_size_step)
-    layouts = _recorder(pop.layout_chosen)
+    overrides = _recorder(pop.override_toggled)
     highlights = _recorder(pop.highlight_toggled)
+    views = _recorder(pop.page_view_chosen)
 
-    assert pop.cards["original"].isChecked()
-    assert pop.layout_buttons["original"].isChecked() and not pop.layout_buttons["livrosound"].isChecked()
+    assert pop.cards["original"].isChecked() and "custom" in pop.cards
+    assert not pop.override_switch.isChecked() and pop.page_view_buttons["single"].isChecked()
     assert pop.highlight_switch.isChecked()
 
     pop.larger.click()
@@ -75,30 +76,23 @@ def test_themes_popover_reports_every_choice(host):
     pop.appearance.click()  # the light/dark partner of the shown theme
     assert themes_seen == ["calm", THEMES["original"].partner]
 
-    pop.layout_buttons["livrosound"].click()
-    pop.layout_buttons["livrosound"].click()  # already chosen: nothing new
-    pop.layout_buttons["original"].click()
-    assert layouts == ["livrosound", "original"]
-
+    pop.override_switch.click()
+    assert overrides == [True]
+    pop.page_view_buttons["double"].click()
+    assert views == ["double"]
     pop.highlight_switch.click()
     assert highlights == [False]
 
 
 def test_themes_popover_setters_do_not_signal(host):
-    pop = w.ThemesPopover(host, "dark", layout="livrosound", highlight=False)
-    layouts = _recorder(pop.layout_chosen)
+    pop = w.ThemesPopover(host, "dark", override=True, highlight=False)
     highlights = _recorder(pop.highlight_toggled)
-    assert not pop.highlight_switch.isChecked()
-    pop.set_layout("original")
+    assert not pop.highlight_switch.isChecked() and pop.override_switch.isChecked()
     pop.set_highlight(True)
     pop.set_theme("quiet")
-    assert pop.layout_buttons["original"].isChecked()
     assert pop.highlight_switch.isChecked()
     assert pop.cards["quiet"].isChecked() and not pop.cards["dark"].isChecked()
-    assert layouts == [] and highlights == []
-    # After set_layout, choosing the other layout is a change again.
-    pop.layout_buttons["livrosound"].click()
-    assert layouts == ["livrosound"]
+    assert highlights == []
 
 
 # ---------- Contents ----------

@@ -116,7 +116,7 @@ class ReadingStyle:
     justify: bool = False
     margin_left: int = -1  # px beside the text; -1 = centered
     margin_right: int = -1
-    max_column: int = 700  # px
+    width: int = 85  # % of the window a centered column fills
 
 
 def centered_scroll_value(current: int, top: int, bottom: int, viewport_height: int, maximum: int) -> int:
@@ -249,7 +249,7 @@ class ReaderView:
     def turn_to(self, value: int) -> None:
         """Paged: show the spread holding scroll value `value` (snapped to a page turn)."""
         step = max(1, self.spread_step())
-        value = max(0, round(value / step) * step)
+        value = max(0, int(value) // step * step)  # the spread holding it (the left page's turn)
         self._allow_value(value)
         value = min(value, self.verticalScrollBar().maximum() // step * step)
         self.stop_scrolling()

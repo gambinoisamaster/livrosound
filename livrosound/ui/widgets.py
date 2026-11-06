@@ -838,24 +838,19 @@ HIGHLIGHT_UNITS = [
 
 
 class ThemesPopover(Popover):
-    """Themes & Settings ("Aa"): text size, light/dark, the reading themes, the
-    layout (the book's own or LivroSound's), the page view, the highlighter, and
-    More Settings… (the Settings window)."""
+    """Themes & Settings ("Aa"): text size, light/dark, the reading themes, Override
+    book layout (this book set with your font and margins instead of its own), the
+    page view, the highlighter, and More Settings… (the Settings window)."""
 
     theme_chosen = Signal(str)
     text_size_step = Signal(int)  # -1 smaller, +1 larger
-    layout_chosen = Signal(str)  # "original" | "livrosound"
+    override_toggled = Signal(bool)
     highlight_toggled = Signal(bool)
     page_view_chosen = Signal(str)  # see PAGE_VIEWS
     highlight_unit_chosen = Signal(str)  # see HIGHLIGHT_UNITS
     settings_requested = Signal()
 
-    LAYOUTS = (
-        ("original", "Original", "The book as it was designed: its pages, fonts and layout"),
-        ("livrosound", "LivroSound", "Clean, adjustable text, like Apple Books"),
-    )
-
-    def __init__(self, parent: QWidget | None, current_key: str, *, layout: str = "livrosound", highlight: bool = True,
+    def __init__(self, parent: QWidget | None, current_key: str, *, override: bool = False, highlight: bool = True,
                  page_view: str = "scroll", highlight_unit: str = "sentence"):
         super().__init__(parent, width=300)
         self.body.addWidget(_popover_title("Themes & Settings"))
@@ -910,32 +905,18 @@ class ThemesPopover(Popover):
         self.body.addLayout(grid)
         self.body.addWidget(_hairline())
 
-        caption = QLabel("Layout")
-        caption.setObjectName("caption")
-        caption.setFont(ui_font(11, QFont.Weight.DemiBold))
-        self.body.addWidget(caption)
-        layouts = QFrame()
-        layouts.setObjectName("segmented")
-        layouts.setFixedHeight(40)
-        seg = QHBoxLayout(layouts)
-        seg.setContentsMargins(4, 4, 4, 4)
-        seg.setSpacing(2)
-        self.layout_buttons: dict[str, QToolButton] = {}
-        group = QButtonGroup(self)
-        for mode, text, tip in self.LAYOUTS:
-            button = QToolButton()
-            button.setText(text)
-            button.setCheckable(True)
-            button.setFont(ui_font(13, QFont.Weight.Medium))
-            button.setFixedHeight(32)
-            button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            button.setCursor(Qt.CursorShape.PointingHandCursor)
-            button.setToolTip(tip)
-            button.clicked.connect(lambda _=False, m=mode: self._choose_layout(m))
-            group.addButton(button)
-            seg.addWidget(button, 1)
-            self.layout_buttons[mode] = button
-        self.body.addWidget(layouts)
+        override_row = QHBoxLayout()
+        override_row.setContentsMargins(2, 0, 2, 0)
+        override_label = QLabel("Override book layout")
+        override_label.setFont(ui_font(13))
+        override_label.setToolTip("Set this book with your font, spacing and margins instead of its own")
+        self.override_switch = ToggleSwitch()
+        self.override_switch.setChecked(override)
+        self.override_switch.toggled.connect(self.override_toggled)
+        override_row.addWidget(override_label)
+        override_row.addStretch(1)
+        override_row.addWidget(self.override_switch, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.body.addLayout(override_row)
 
         caption = QLabel("Pages")
         caption.setObjectName("caption")
@@ -967,9 +948,7 @@ class ThemesPopover(Popover):
         self.more_button = more
 
         self._key = current_key
-        self._layout = layout
         self.set_theme(current_key)
-        self.set_layout(layout)
         self.set_highlight(highlight)
 
     def set_theme(self, key: str) -> None:
@@ -980,22 +959,11 @@ class ThemesPopover(Popover):
         self.appearance.setIcon(half_circle_icon(themes.current().text))
         self.update()
 
-    def set_layout(self, mode: str) -> None:
-        """Show mode as chosen (no signal)."""
-        self._layout = mode
-        for m, button in self.layout_buttons.items():
-            button.setChecked(m == mode)
-
     def set_highlight(self, on: bool) -> None:
         """Show the switch on or off (no signal)."""
         self.highlight_switch.blockSignals(True)
         self.highlight_switch.setChecked(on)
         self.highlight_switch.blockSignals(False)
-
-    def _choose_layout(self, mode: str):
-        if mode != self._layout:
-            self._layout = mode
-            self.layout_chosen.emit(mode)
 
 
 # ---------- contents ----------

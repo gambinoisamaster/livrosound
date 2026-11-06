@@ -80,7 +80,10 @@ class Settings:
     justify: bool = False
     margin_left: int = -1  # px beside the text column; -1 = centered
     margin_right: int = -1
-    max_column: int = 700  # px: the widest the text column gets
+    text_width: int = 85  # % of the window the centered text column fills
+    # Books open as their file made them; with this on (the default for books without a
+    # choice of their own) LivroSound sets them with the font, spacing and margins above.
+    override_layout: bool = False
     page_view: str = "scroll"  # "scroll" | "single" | "double"
     show_page_numbers: bool = True
     show_read_percent: bool = True
@@ -90,7 +93,8 @@ class Settings:
     # Listening.
     highlight_unit: str = "sentence"  # "word" | "sentence" | "paragraph"
     read_aloud: bool = True  # False: LivroSound is an e-reader only (no audio at all)
-    export_format: str = "mp3"  # "mp3" | "m4b"
+    export_format: str = "m4b"  # "mp3" | "m4b"
+    export_folder: str = ""  # where audio is saved ("" = ~/Music)
     # Measured generation speed (spoken characters per second of wall time), so the
     # time estimates get better with use; 0 = not measured yet.
     rate_normal: float = 0.0
@@ -111,6 +115,14 @@ class Settings:
         )
 
 
+# The settings a book can have of its own (Settings ▸ Font / Layout, with "Set as default
+# for all books" off); the theme and the page view are always app-wide.
+BOOK_STYLE_FIELDS = (
+    "font_family", "font_weight", "reflow_font_size", "line_spacing", "paragraph_spacing", "word_spacing",
+    "letter_spacing", "justify", "margin_left", "margin_right", "text_width",
+)
+
+
 @dataclass
 class BookRecord:
     book_id: str
@@ -118,7 +130,9 @@ class BookRecord:
     author: str
     source_path: str
     source_kind: str  # "pdf" | "epub" | "docx" | "txt"
-    layout: str = "livrosound"  # "original" | "livrosound"
+    # "original" = as the file made it, "livrosound" = Override book layout on for this book,
+    # "" = follow Settings.override_layout.
+    layout: str = ""
     engine: str = ""
     voice: str = ""
     audio_signature: str = ""  # audio_signature() of the audio in the book's store
@@ -145,6 +159,10 @@ class BookRecord:
     info_version: int = 0
     tags: list = field(default_factory=list)
     collections: list = field(default_factory=list)
+    # This book's own font, spacing and margins (BOOK_STYLE_FIELDS), over the Settings' ones.
+    style: dict = field(default_factory=dict)
+    # Save the audio when generation reaches 100%: {"format": "m4b"|"mp3", "folder": path}; {} = don't.
+    auto_export: dict = field(default_factory=dict)
 
     def audio_options(self) -> SpeechOptions | None:
         """speech_options as SpeechOptions (None when unset or unreadable)."""
@@ -190,6 +208,52 @@ class Library:
     def recent(self) -> list[BookRecord]:
         """Newest last_opened first; never-opened records last."""
         return sorted(self._records.values(), key=lambda r: r.last_opened, reverse=True)
+
+
+class StyleStore:
+    """Where Settings ▸ Font / Layout reads and writes: the open book's own choices (its
+    record's layout and style), or — with "Set as default for all books", or no book
+    open — the Settings every book without choices of its own follows."""
+
+    def __init__(self, settings: Settings, record: BookRecord | None = None):
+        self.settings, self.record = settings, record
+        self.as_default = record is None
+
+    def get(self, field: str):
+        if self.record is not None and field in BOOK_STYLE_FIELDS and field in self.record.style:
+            return self.record.style[field]
+        return getattr(self.settings, field)
+
+    def set(self, field: str, value) -> None:
+        if field not in BOOK_STYLE_FIELDS:
+            setattr(self.settings, field, value)
+        elif self.as_default:
+            setattr(self.settings, field, value)
+            if self.record is not None:
+                self.record.style.pop(field, None)
+        else:
+            self.record.style[field] = value
+
+    def overridden(self) -> bool:
+        layout = self.record.layout if self.record is not None else ""
+        return layout == "livrosound" if layout in ("original", "livrosound") else self.settings.override_layout
+
+    def set_overridden(self, on: bool) -> None:
+        if self.as_default:
+            self.settings.override_layout = on
+            if self.record is not None:
+                self.record.layout = ""
+        else:
+            self.record.layout = "livrosound" if on else "original"
+
+    def set_as_default(self, on: bool) -> None:
+        """Set as default for all books: this book's choices become everyone's, and it follows them."""
+        self.as_default = on or self.record is None
+        if on and self.record is not None:
+            for field in BOOK_STYLE_FIELDS:
+                setattr(self.settings, field, self.get(field))
+            self.settings.override_layout = self.overridden()
+            self.record.style, self.record.layout = {}, ""
 
 
 def audio_signature(engine: str, voice: str, options: SpeechOptions) -> str:

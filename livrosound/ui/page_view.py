@@ -47,11 +47,12 @@ The highlight follows the user's rules for the original layout:
 Clicks and hover use a per-page index of word boxes built once in set_book.
 
 Page views: "scroll" is the continuous column above. "single" and "double"
-show one page (or two side by side) fitted whole into the window, each spread
-exactly one viewport high, so a page turn moves the (hidden) scroll bar by
-the viewport's height and the rendering, highlighting and hit testing above
-work unchanged. The user's margins (ReadingStyle) replace GUTTER beside the
-pages.
+show each printed page whole (not cropped: as in Preview or Readest), one or two
+side by side meeting at the spine, lying on paper (paper.py) with the chapter at
+the top left and "24 / 254" at the bottom right. Each spread is exactly one
+viewport high, so a page turn moves the (hidden) scroll bar by the viewport's
+height and the rendering, highlighting and hit testing above work unchanged.
+The user's margins (ReadingStyle) replace GUTTER beside the scrolling pages.
 """
 
 from __future__ import annotations
@@ -68,8 +69,10 @@ import pymupdf
 from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QImage, QKeyEvent, QPainter, QPainterPath
 from PySide6.QtWidgets import QAbstractScrollArea, QApplication, QFrame
+from shiboken6 import isValid
 
 from livrosound.book import Book, PageInfo, Word
+from livrosound.ui import paper
 from livrosound.ui import theme as themes
 from livrosound.ui.reader_view import (
     PAGE_MODES,
@@ -394,7 +397,10 @@ _quit_hooked = False
 
 def _stop_all_workers() -> None:
     for worker in list(_live_workers):
-        worker.stop()
+        if isValid(worker):  # at interpreter exit Qt may have deleted it already
+            worker.stop()
+        else:
+            _live_workers.discard(worker)
 
 
 atexit.register(_stop_all_workers)
@@ -416,8 +422,10 @@ class _WorkerHandle:
 
     def stop(self, *_) -> None:
         worker, self.worker = self.worker, None
-        if worker is not None:
+        if worker is not None and isValid(worker):
             worker.stop()
+        elif worker is not None:
+            _live_workers.discard(worker)
 
 
 # ---------- the view ----------
@@ -436,6 +444,7 @@ class PageView(ReaderView, QAbstractScrollArea):
         self._theme = themes.current()
         self._zoom = 1.0
         self._crops: list[Box] = []
+        self._text_crops: list[Box] = []  # each page's text box (+ margin): what scrolling shows
         self._fits: list[float] = []  # < 1 for a page wider than most, so it still fits the width
         self._scale = 1.0  # logical px per PDF point on a typical page
         self._rects: list[QRect] = []  # each page in content coordinates (logical px)
@@ -490,7 +499,8 @@ class PageView(ReaderView, QAbstractScrollArea):
                 self._words.setdefault(word[0], []).append((box, index, word[5]))
                 boxes.setdefault(word[0], []).append(box)
         self._block_pages = [b.page if b.page >= 0 else (b.words[0][0] if b.words else -1) for b in book.blocks]
-        self._crops = crop_boxes(book, boxes)
+        self._text_crops = crop_boxes(book, boxes)
+        self._crops = self._page_crops()
         widths = sorted(c[2] - c[0] for c in self._crops)
         typical = widths[len(widths) // 2] if widths else 1.0
         self._fits = [min(1.0, typical / (c[2] - c[0])) for c in self._crops]
@@ -528,8 +538,24 @@ class PageView(ReaderView, QAbstractScrollArea):
         if mode == self._page_mode:
             return
         anchor = self._anchor()
+        was_paged = self.paged()
         self._page_mode = mode
         paged = mode != "scroll"
+        if self._book is not None and paged != was_paged:
+            # Whole pages when paged, the text box when scrolling: new images, a new render thread.
+            self._crops = self._page_crops()
+            widths = sorted(c[2] - c[0] for c in self._crops)
+            typical = widths[len(widths) // 2] if widths else 1.0
+            self._fits = [min(1.0, typical / (c[2] - c[0])) for c in self._crops]
+            self._serial += 1
+            self._cache.clear()
+            self._previews.clear()
+            self._failed.clear()
+            if self._book.source_path and Path(self._book.source_path).is_file():
+                worker = self._render.start(self._book.source_path)
+                worker.rendered.connect(self._on_rendered)
+                worker.failed.connect(self._on_failed)
+            self._render_key = None
         self.setVerticalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff if paged else Qt.ScrollBarPolicy.ScrollBarAlwaysOn
         )
@@ -540,6 +566,8 @@ class PageView(ReaderView, QAbstractScrollArea):
             self._relayout(keep_anchor=False)
             if anchor is not None:
                 self._restore_anchor(anchor)
+            if self._render_key is None:
+                self._sharpen()  # the new render thread's first pages
 
     def set_style(self, style: ReadingStyle) -> None:
         """Only the margins apply to a PDF's own pages."""
@@ -565,6 +593,12 @@ class PageView(ReaderView, QAbstractScrollArea):
             page = min(pages, key=lambda i: abs(self._rects[i].center().y() - middle))
             pages = [page]
         return pages[0] + 1, pages[-1] + 1, len(self._rects)
+
+    def _page_crops(self) -> list[Box]:
+        """The part of each page shown: all of it when paged, the text box when scrolling."""
+        if self.paged() and self._book is not None:
+            return [(0.0, 0.0, float(info.width), float(info.height)) for info in self._book.pages]
+        return list(self._text_crops)
 
     def _per_spread(self) -> int:
         return 2 if self._page_mode == "double" else 1
@@ -866,7 +900,7 @@ class PageView(ReaderView, QAbstractScrollArea):
         heights = sorted((c[3] - c[1]) * f for c, f in zip(self._crops, self._fits)) if self._crops else [1.0]
         typical_height = heights[len(heights) // 2]
         across = (room - PAGE_GAP * (per - 1)) / per / typical_width
-        down = (height - 2 * EDGE) / typical_height
+        down = (height - 2 * paper.SHEET_MARGIN) / typical_height
         self._scale = max(0.02, min(across * self._zoom, down))
         sizes = [self._job_size(i, self._scale) for i in range(len(self._crops))]
         rects, tops = [], []
@@ -874,12 +908,12 @@ class PageView(ReaderView, QAbstractScrollArea):
         for first in range(0, len(sizes), per):
             group = sizes[first : first + per]
             top = first // per * height
-            used = sum(w for w, _ in group) + PAGE_GAP * (len(group) - 1)
+            used = sum(w for w, _ in group)  # a spread's pages meet at the spine
             x = left + (room - used) // 2
             for w, h in group:
-                rects.append(QRect(x, top + max(EDGE, (height - h) // 2), w, h))
+                rects.append(QRect(x, top + max(0, (height - h) // 2), w, h))
                 tops.append(top)
-                x += w + PAGE_GAP
+                x += w
         self._rects, self._tops = rects, tops
         spreads = -(-len(sizes) // per)
         self._content = (width, spreads * height)
@@ -1048,7 +1082,10 @@ class PageView(ReaderView, QAbstractScrollArea):
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self.viewport())
-        painter.fillRect(event.rect(), QColor(self._theme.window))
+        if self.paged():
+            paper.paint_paper(painter, QRectF(self.viewport().rect()), self._theme)
+        else:
+            painter.fillRect(event.rect(), QColor(self._theme.window))
         h, v = self.horizontalScrollBar().value(), self.verticalScrollBar().value()
         key, dpr = self._key(), self.viewport().devicePixelRatioF()
         highlighted = {band.page for band in self._bands}
@@ -1073,6 +1110,14 @@ class PageView(ReaderView, QAbstractScrollArea):
                 self._paint_marks(painter, page, rect, shown)
             if page in highlighted:
                 self._paint_bands(painter, page, rect, shown)
+        if self.paged() and self._rects:
+            pages = list(self._visible_pages())
+            if len(pages) == 2:
+                paper.paint_spine(painter, QRectF(self._rects[pages[0]]).translated(-h, -v), self._theme)
+            entry = self._book.chapter_of(self.current_block()) if self._book is not None else None
+            head = entry.title if entry is not None else (self._book.title if self._book else "")
+            paper.paint_labels(painter, QRectF(self.viewport().rect()), head,
+                               f"{pages[0] + 1} / {len(self._rects)}", self._theme)
         painter.end()
 
     def _shown(self, page: int, key: _Key) -> _Entry | None:
@@ -1084,7 +1129,10 @@ class PageView(ReaderView, QAbstractScrollArea):
         return preview
 
     def _paint_frame(self, painter: QPainter, rect: QRectF) -> None:
-        """A soft shadow under the page (a hairline on dark themes)."""
+        """A soft shadow under the page (a hairline on dark themes); a sheet's on paper."""
+        if self.paged():
+            paper.paint_sheet(painter, rect, self._theme, fill=False)
+            return
         painter.setPen(Qt.PenStyle.NoPen)
         if self._theme.dark:
             painter.setBrush(QColor(self._theme.line))

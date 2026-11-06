@@ -793,7 +793,8 @@ def test_single_and_double_page_show_whole_pages_and_turn_them(view, pdf_book, q
     assert list(view._visible_pages()) == [0, 1] or list(view._visible_pages()) == [2, 3]
     view.turn_to(0)
     left, right = view.page_rect(0), view.page_rect(1)
-    assert left.right() < right.left() and abs(left.top() - right.top()) < height / 4
+    assert left.right() == right.left() and abs(left.top() - right.top()) < height / 4  # meeting at the spine
+    assert view.crop_box(0) == (0.0, 0.0, pdf_book.pages[0].width, pdf_book.pages[0].height)  # whole pages
     assert view.page_info() == (1, 2, pages)
     # A word on the right page is clicked like any other.
     block = next(i for i, b in enumerate(pdf_book.blocks) if b.words and b.words[0][0] == 1)
@@ -805,8 +806,10 @@ def test_single_and_double_page_show_whole_pages_and_turn_them(view, pdf_book, q
     view.show_highlight(far, 0, 5)
     view.keep_in_view(far, 0, 5)
     assert pdf_book.blocks[far].words[0][0] in view._visible_pages()
+    view.viewport().grab()  # paints the paper, the spine and the labels
     view.set_page_mode("scroll")
     assert view.verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOn
+    assert view.crop_box(0) != (0.0, 0.0, pdf_book.pages[0].width, pdf_book.pages[0].height)  # the text box again
 
 
 def test_margins_move_the_pages(view, qapp):

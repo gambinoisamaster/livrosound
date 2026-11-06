@@ -9,8 +9,7 @@ import wave
 from datetime import date, datetime, timedelta
 
 import pytest
-from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, Qt, Signal
-from PySide6.QtGui import QMouseEvent, QPixmap
+from PySide6.QtCore import QObject, QPoint, Qt, Signal
 from PySide6.QtWidgets import QApplication, QDialog, QWidget
 
 from livrosound import paths
@@ -83,7 +82,7 @@ def test_import_progress_and_cancel(host):
     assert dialog.result() == QDialog.DialogCode.Accepted
 
 
-# ---------- Choose a Layout ----------
+# ---------- a book for the dialogs ----------
 
 PARAGRAPH = (
     "1801.—I have just returned from a visit to my landlord—the solitary neighbour that I shall be "
@@ -107,66 +106,6 @@ def _book(kind: str) -> Book:
             Block("paragraph", PARAGRAPH),
         ],
     )
-
-
-@pytest.mark.parametrize("kind, default", [("pdf", "original"), ("epub", "livrosound"), ("docx", "livrosound"),
-                                           ("txt", "livrosound")])
-def test_layout_default_per_format(host, kind, default):
-    dialog = d.LayoutDialog(host, _book(kind))
-    assert dialog.choice() == default
-    assert dialog.continue_button.isEnabled()
-    assert dialog.windowTitle() == "LivroSound | Choose a Layout"
-    assert dialog.subtitle_label.text() == "You can change this any time from Aa."
-    assert [c.title for c in dialog.cards.values()] == ["Keep Original Layout", "LivroSound Layout"]
-    assert dialog.cards["original"].height() == dialog.cards["livrosound"].height()
-
-
-def test_layout_ask(host, monkeypatch):
-    def pick_original(dlg):
-        dlg.cards["original"].click()
-        dlg.continue_button.click()
-
-    _answer(monkeypatch, d.LayoutDialog, pick_original)
-    assert d.LayoutDialog.ask(host, _book("epub")) == "original"
-    _answer(monkeypatch, d.LayoutDialog, lambda dlg: dlg.continue_button.click())
-    assert d.LayoutDialog.ask(host, _book("epub")) == "livrosound"
-    _answer(monkeypatch, d.LayoutDialog, lambda dlg: dlg.cancel_button.click())
-    assert d.LayoutDialog.ask(host, _book("pdf")) is None
-
-
-def test_layout_double_click_continues(host, monkeypatch):
-    def double_click(dlg):
-        card = dlg.cards["livrosound"]
-        center = QPointF(card.rect().center())
-        event = QMouseEvent(QEvent.Type.MouseButtonDblClick, center, center, Qt.MouseButton.LeftButton,
-                            Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
-        QApplication.sendEvent(card, event)
-
-    _answer(monkeypatch, d.LayoutDialog, double_click)
-    assert d.LayoutDialog.ask(host, _book("pdf")) == "livrosound"
-
-
-def test_layout_sample_is_the_books_opening():
-    assert d._opening(_book("epub")) == ("Chapter I", PARAGRAPH)
-    empty = Book("e", "Empty Book", "", "/x/e.txt", "txt")
-    assert d._opening(empty) == ("Empty Book", "")
-
-
-@pytest.mark.parametrize("key", ["original", "dark"])
-def test_layout_cards_paint_with_and_without_previews(host, key):
-    themes.set_current(THEMES[key])
-    host.setStyleSheet(stylesheet(THEMES[key]))
-    page = QPixmap(120, 200)
-    page.fill(Qt.GlobalColor.white)
-    for originals in ((None, None), (page, page)):
-        dialog = d.LayoutDialog(host, _book("pdf"), *originals)
-        for card in dialog.cards.values():
-            image = card.grab().toImage()
-            assert not image.isNull()
-        # The chosen card is ringed in fern.
-        ring = dialog.cards["original"].grab().toImage().pixelColor(1, 40)
-        assert ring.green() > ring.red() and ring.green() > ring.blue()
-    themes.set_current(THEMES["original"])
 
 
 # ---------- Choose a Voice ----------
@@ -431,7 +370,6 @@ def test_every_dialog_paints(host, key, library, renders):
     voice = d.ChooseVoiceDialog(host, NamedEngine("Pocket-TTS"), "Ana", renders)
     dialogs = [
         progress,
-        d.LayoutDialog(host, _book("epub")),
         voice,
         d.CustomizeAudioDialog(host, Settings(), (False, "Whisper is not installed.")),
         d.BookDetailsDialog(host, library.get("mid"), [], []),
@@ -458,17 +396,24 @@ def test_settings_tabs_change_settings_live(host):
     dialog.changed.connect(changes.append)
     assert [b.text() for b in dialog.tab_buttons.values()] == list(d.SettingsDialog.TABS)
     dialog.show_tab("Layout")
-    assert dialog.pages.currentIndex() == 1
+    assert dialog.pages.currentIndex() == 1 and not dialog.override_box.isHidden()
+    assert dialog.default_box.isHidden()  # no book open: these are the defaults
+    assert not dialog.controls["line_spacing"].isEnabled()  # until Override book layout is on
+    dialog.override_switch.setChecked(True)
+    assert settings.override_layout and changes[-1] == "override" and dialog.controls["line_spacing"].isEnabled()
     dialog.controls["line_spacing"].setValue(20)
     assert settings.line_spacing == 2.0 and changes[-1] == "line_spacing"
     dialog.controls["word_spacing"].setValue(3)
     assert settings.word_spacing == 3.0
     dialog.controls["justify"].setChecked(True)
     assert settings.justify
-    # Margins: centered until the switch is turned off, then the sliders set them.
-    assert not dialog.controls["margin_left"].isEnabled()
+    # Margins: centered (at the text width) until the switch is turned off, then the sliders set them.
+    assert not dialog.controls["margin_left"].isEnabled() and dialog.controls["text_width"].isEnabled()
+    dialog.controls["text_width"].setValue(70)
+    assert settings.text_width == 70
     dialog.controls["centered"].setChecked(False)
     assert settings.margin_left == 64 and dialog.controls["margin_left"].isEnabled()
+    assert not dialog.controls["text_width"].isEnabled()
     dialog.controls["margin_left"].setValue(50)
     assert settings.margin_left == 200
     dialog.controls["centered"].setChecked(True)
@@ -482,7 +427,8 @@ def test_settings_tabs_change_settings_live(host):
     assert settings.theme == "calm"
     dialog._choose_color("custom_page", "Paper…")
     assert settings.custom_page == "#102030"
-    dialog.controls["highlight_unit"].findChildren(QWidget)  # the segmented control exists
+    dialog.show_tab("Color")
+    assert dialog.override_box.isHidden()
     page_buttons = dialog.controls["page_view"].findChildren(d.QToolButton)
     next(b for b in page_buttons if b.text() == "Double").click()
     assert settings.page_view == "double"
@@ -505,20 +451,59 @@ def test_custom_theme_colors(qapp):
     assert themes.theme_for("custom") is light
 
 
-def test_chapter_export_dialog(host, monkeypatch):
+def test_generate_audio_dialog_asks_about_exporting(host, monkeypatch):
+    dialog = d.GenerateAudioDialog(host, "m4b", "/music", choose_folder=lambda current: "/books")
+    assert dialog.title_label.text() == "Generate audio from the beginning?"
+    assert dialog.export_row.switch.isChecked() and dialog.format_buttons["m4b"].isChecked()
+    assert dialog.plan() == {"format": "m4b", "folder": "/music"}
+    dialog.format_buttons["mp3"].click()
+    dialog.folder_row.change()
+    assert dialog.plan() == {"format": "mp3", "folder": "/books"} and "/books" in dialog.folder_row.label.text()
+    dialog.export_row.switch.setChecked(False)
+    assert dialog.plan() == {} and not dialog.format_row.isEnabled()
+    _answer(monkeypatch, d.GenerateAudioDialog, lambda dlg: dlg.yes_button.click())
+    assert d.GenerateAudioDialog.ask(host, "m4b", "/m") == (True, {"format": "m4b", "folder": "/m"})
+    _answer(monkeypatch, d.GenerateAudioDialog, lambda dlg: dlg.no_button.click())
+    assert d.GenerateAudioDialog.ask(host, "mp3", "/m") == (False, {"format": "mp3", "folder": "/m"})
+
+
+def test_export_audio_dialog(host, monkeypatch):
     rows = [("Chapter One", "12 min", True), ("Chapter Two", "15 min", False), ("Chapter Three", "9 min", False)]
-    dialog = d.ChapterExportDialog(host, rows, "mp3", "/music", eta=lambda indices: f"{len(indices)} to make",
-                                   choose_folder=lambda current: "/elsewhere")
-    assert not dialog.export_button.isEnabled() and dialog.chosen() == []
+    dialog = d.ExportAudioDialog(host, rows, "m4b", "/music", book_ready=False, eta=lambda i: "about 2 h",
+                                 choose_folder=lambda current: "/elsewhere")
+    assert dialog.mode == "book" and dialog.card.isHidden() and dialog.format_buttons["m4b"].isChecked()
+    assert dialog.export_button.text() == "Generate && Export" and "about 2 h" in dialog.summary.text()
+    dialog.mode_buttons["chapters"].click()
+    assert dialog.mode == "chapters" and not dialog.card.isHidden() and not dialog.export_button.isEnabled()
     dialog.list.item(0).setCheckState(Qt.CheckState.Checked)
     assert dialog.export_button.text() == "Export" and "ready to save" in dialog.summary.text()
     dialog.list.item(1).setCheckState(Qt.CheckState.Checked)
-    assert dialog.export_button.text() == "Generate & Export" and "(1 to make)" in dialog.summary.text()
-    dialog.format_buttons["m4b"].click()
-    dialog._change_folder()
-    assert (dialog.chosen(), dialog.fmt, dialog.folder) == ([0, 1], "m4b", "/elsewhere")
+    assert dialog.export_button.text() == "Generate && Export"
     dialog.all_button.click()
     assert dialog.chosen() == [0, 1, 2]
-    _answer(monkeypatch, d.ChapterExportDialog, lambda dlg: (dlg.list.item(2).setCheckState(Qt.CheckState.Checked),
-                                                            dlg.export_button.click()))
-    assert d.ChapterExportDialog.ask(host, rows, "mp3", "/m") == ([2], "mp3", "/m")
+    _answer(monkeypatch, d.ExportAudioDialog, lambda dlg: (dlg.format_buttons["mp3"].click(), dlg.folder_row.change(),
+                                                          dlg.export_button.click()))
+    assert d.ExportAudioDialog.ask(host, rows, "m4b", "/m", choose_folder=lambda c: "/x") == ("book", [], "mp3", "/x")
+    _answer(monkeypatch, d.ExportAudioDialog, lambda dlg: dlg.cancel_button.click())
+    assert d.ExportAudioDialog.ask(host, rows, "m4b", "/m") is None
+
+def test_settings_for_one_book_or_as_the_default(host):
+    from livrosound.library import StyleStore
+
+    settings = Settings()
+    record = BookRecord("bk", "A Book", "", "/x/a.epub", "epub")
+    styles = StyleStore(settings, record)
+    dialog = d.SettingsDialog(host, settings, styles=styles)
+    assert not dialog.default_box.isHidden() and not dialog.default_box.isChecked()
+    dialog.override_switch.setChecked(True)
+    assert record.layout == "livrosound" and not settings.override_layout  # this book only
+    dialog.controls["line_spacing"].setValue(20)
+    assert record.style == {"line_spacing": 2.0} and settings.line_spacing == 1.5
+    dialog.default_box.setChecked(True)  # Set as default for all books
+    assert settings.override_layout and settings.line_spacing == 2.0
+    assert record.style == {} and record.layout == ""  # the book follows the defaults now
+    dialog.controls["word_spacing"].setValue(4)
+    assert settings.word_spacing == 4.0 and record.style == {}
+    other = BookRecord("b2", "Another", "", "/x/b.epub", "epub", layout="original")
+    assert not StyleStore(settings, other).overridden()  # a book with its own choice keeps it
+    assert StyleStore(settings, BookRecord("b3", "New", "", "/x/c.epub", "epub")).overridden()

@@ -42,6 +42,7 @@ stylesheet: it would override the per-widget fonts.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from pathlib import Path
 
 from PySide6.QtGui import QColor, QFont, QFontDatabase
 
@@ -63,6 +64,7 @@ EXPORT_BLUE = "#1A4FA8"  # Export MP3 takes the finished bar's place, in its blu
 
 # The book's typeface, best first (Apple Books' default is Iowan; the rest are fallbacks).
 READING_FAMILIES = ["Iowan Old Style", "New York", "Charter", "Georgia"]
+CHECK_ICON = (Path(__file__).resolve().parents[2] / "assets" / "icons" / "check.svg").as_posix()  # ticked boxes
 
 
 @dataclass(frozen=True)
@@ -391,6 +393,13 @@ QMenu::indicator {{ width: 14px; left: 7px; }}
 
 QLabel#readingInfo {{ color: {t.muted}; background: {_alpha(t.page, 0.9)}; border: 1px solid {t.hairline};
            border-radius: 10px; padding: 2px 9px; }}
+
+QListWidget#chapterList::item {{ color: {t.text}; padding: 2px 6px; border: none; }}
+QListWidget#chapterList::item:selected {{ background: transparent; }}
+QListWidget#chapterList::indicator {{ width: 16px; height: 16px; border-radius: 4px; }}
+QListWidget#chapterList::indicator:unchecked {{ border: 1px solid {t.muted}; background: {t.raised}; }}
+QListWidget#chapterList::indicator:checked {{ border: 1px solid {ACCENT}; background: {ACCENT};
+           image: url("{CHECK_ICON}"); }}
 
 QLabel#castingTitle, QLabel#alertTitle {{ color: {t.text}; }}
 QLabel#castingSubtitle, QLabel#hint, QLabel#alertText {{ color: {t.muted}; }}

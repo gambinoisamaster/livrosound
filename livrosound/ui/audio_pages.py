@@ -124,7 +124,7 @@ class GenerationPage(_Page):
         )
         for label in (self.eta, self.note):
             label.setFixedWidth(560)
-            label.setMinimumHeight(label.heightForWidth(560))
+            label.setMinimumHeight(2 * label.fontMetrics().lineSpacing() + 2)  # room for two lines
         after = _label("When it's done, save:", 13)
         frame, self.after_buttons = segmented_control(AFTER_CHOICES, "nothing", self.after_chosen.emit, self)
         frame.setFixedWidth(420)

@@ -5,7 +5,7 @@ modules together (docs/DESIGN.md, "User flows (binding)"), the way Script
 Radio's main window does:
 
     landing  -> Upload New Book -> import thread (PDF with text, EPUB, DOCX, TXT)
-             -> LayoutDialog -> ChooseVoiceDialog <-> CustomizeAudioDialog
+             -> ChooseVoiceDialog <-> CustomizeAudioDialog
              -> the reader -> "Generate audio from the beginning?"
     landing  -> Go to Library -> LibraryPage (covers; search, group, sort, tags,
                 collections) -> the reader at the saved position ->
@@ -61,12 +61,10 @@ from PySide6.QtGui import (
     QCursor,
     QFontMetrics,
     QGuiApplication,
-    QImage,
     QKeySequence,
     QPainter,
     QPalette,
     QPen,
-    QPixmap,
     QPolygonF,
 )
 from PySide6.QtMultimedia import QMediaDevices, QSoundEffect
@@ -96,7 +94,7 @@ from ..engines import load_engines
 from ..engines.base import TTSEngine
 from ..generation import GenerationCancelled, Generator, stream_ready
 from ..ingest import SUPPORTED_SUFFIXES, BookImportError, ImportCancelled, book_id_for, load_book
-from ..library import BookRecord, Library, Settings, audio_signature
+from ..library import BookRecord, Library, Settings, StyleStore, audio_signature
 from ..sentences import split_sentences, word_at
 from ..timeline import Timeline
 from ..validate import Transcriber
@@ -141,9 +139,8 @@ INFO_FADE_MS = 3000  # the page and progress fade this long after the reader las
 PAGE_COUNT_DELAY_MS = 400  # counting a reflowed book's pages waits for resizing to settle
 FIND_COLOR = "#FF9F1A"  # the current Find match, under the reading highlight
 STYLE_FIELDS = ("font_family", "font_weight", "line_spacing", "paragraph_spacing", "word_spacing",
-                "letter_spacing", "justify", "margin_left", "margin_right", "max_column")
+                "letter_spacing", "justify", "margin_left", "margin_right", "text_width")
 BOOK_FILTER = "Books (*.pdf *.epub *.docx *.txt)"
-PREVIEW_SIZE = QSize(488, 496)  # LayoutDialog thumbnails, rendered at twice the card's size
 
 CREDITS_HTML = """
 <h3>LivroSound</h3>
@@ -386,7 +383,6 @@ class MainWindow(QMainWindow):
         self._meter: estimate.RateMeter | None = None  # how fast the running worker goes
         self._keep_awake = KeepAwake("Generating audio for an audiobook")
         self._generation_only = False  # audio-generation only mode: no text, no streaming
-        self._after_generation = "nothing"  # what generation-only mode saves at 100% (audio_pages.AFTER_CHOICES)
         # Chapters chosen in Export Chapters: (number, title, blocks), saved (in order) as each is ready.
         self._chapter_jobs: list[tuple[int, str, list[int]]] = []
         self._chapter_target: tuple[str, Path, int] | None = None  # (format, folder, chapters in the book)
@@ -515,12 +511,10 @@ class MainWindow(QMainWindow):
         audio_menu.addAction(self.generation_only_action)
         audio_menu.addAction(self.player_only_action)
         audio_menu.addSeparator()
-        self.export_actions = {}
-        for key, text in (("mp3", "Export MP3…"), ("m4b", "Export M4B Audiobook…"), ("chapters", "Export Chapters…")):
-            action = QAction(text, self)
-            action.triggered.connect(lambda _=False, k=key: self.export_chapters() if k == "chapters" else self.export(k))
-            audio_menu.addAction(action)
-            self.export_actions[key] = action
+        self.export_action = QAction("Export Audio…", self)
+        self.export_action.setShortcut(QKeySequence("Ctrl+Shift+E"))
+        self.export_action.triggered.connect(self.export_audio)
+        audio_menu.addAction(self.export_action)
         self.audio_menu = audio_menu
         edit_menu = self.menuBar().addMenu("Edit")
         for text, keys, slot in (
@@ -682,20 +676,13 @@ class MainWindow(QMainWindow):
         self.eta_label.setFont(ui_font(11))
         self.eta_label.hide()
         sb.addPermanentWidget(self.eta_label)
-        self.export_button = QPushButton("Export MP3")
+        self.export_button = QPushButton("Export Audio")
         self.export_button.setObjectName("exportButton")
-        self.export_button.setToolTip("Save the whole book as one file, with chapters")
-        self.export_more = QPushButton("More…")
-        self.export_more.setObjectName("exportButton")
-        self.export_more.setToolTip("Export as MP3, as an M4B audiobook, or chapter by chapter")
-        self.export_more.clicked.connect(
-            lambda: self.audio_menu.exec(self.export_more.mapToGlobal(QPoint(0, -self.audio_menu.sizeHint().height())))
-        )
+        self.export_button.setToolTip("Save the audio as M4B or MP3: the whole book, or chapter by chapter")
         self.resume_button = QPushButton("Resume Generating")
         self.resume_button.setObjectName("resumeButton")
         self.resume_button.setToolTip("Make the rest of the audio, from where you are")
-        for button, slot in ((self.export_button, lambda: self.export()), (self.export_more, None),
-                             (self.resume_button, self.resume_generation)):
+        for button, slot in ((self.export_button, self.export_audio), (self.resume_button, self.resume_generation)):
             button.setFixedHeight(22)  # the stylesheet rounds them with half of this
             button.setCursor(Qt.CursorShape.PointingHandCursor)
             button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -806,9 +793,16 @@ class MainWindow(QMainWindow):
         view.hide()
         return view
 
+    def _styles(self) -> StyleStore:
+        return StyleStore(self.settings, self.record)
+
     def _layout_mode(self) -> str:
-        layout = self.record.layout if self.record is not None else ""
-        return layout if layout in ("original", "livrosound") else "livrosound"
+        """"livrosound" with Override book layout on (this book's choice, else the default),
+        else "original": the book as its file made it. A text file has no layout of its own:
+        it is always set by LivroSound (with the default type unless overridden)."""
+        if self.book is not None and self.book.source_kind == "txt":
+            return "livrosound"
+        return "livrosound" if self._styles().overridden() else "original"
 
     def _setup_view(self):
         """Show the book in its layout: a PDF's own pages in PageView, everything else in ReflowView.
@@ -830,7 +824,7 @@ class MainWindow(QMainWindow):
             view.set_scale(self.settings.page_zoom)
         else:
             view = self._reflow()
-            view.set_scale(self.settings.reflow_font_size)
+            view.set_scale(self._styles().get("reflow_font_size"))
         view.set_theme(self.theme)
         view.set_style(self._reading_style())
         view.set_page_mode(self.settings.page_view)
@@ -1073,7 +1067,7 @@ class MainWindow(QMainWindow):
         self._close_book()
         record = self.library.get(book.book_id) or BookRecord(
             book.book_id, book.title, book.author, book.source_path, book.source_kind,
-            layout="original" if book.source_kind == "pdf" else "livrosound", date_added=_now(),
+            date_added=_now(),
         )
         if info is not None:
             _apply_info(record, info)
@@ -1081,10 +1075,7 @@ class MainWindow(QMainWindow):
             self.library_page.cover_changed(book.book_id)
         record.title, record.author = book.title, book.author
         record.source_path, record.source_kind = book.source_path, book.source_kind
-        layout = dialogs.LayoutDialog.ask(self, book, *self._layout_previews(book))
-        if layout is not None:
-            record.layout = layout
-        generate = layout is not None and self.settings.read_aloud and self._choose_voice()
+        generate = self.settings.read_aloud and self._choose_voice()
         if self._closing:
             return
         self._close_book()  # (nothing is open, unless something slipped in under the dialogs)
@@ -1591,9 +1582,10 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("All of this book's audio is ready.", 6000)
             return
         book = self.book
-        start = confirm(self, "Generate audio from the beginning?", "")
+        start, plan = dialogs.GenerateAudioDialog.ask(self, self.settings.export_format, self._export_folder())
         if not self._still(book):
             return
+        self._keep_plan(plan)
         if start:
             self._start_generation(self.order[0])
         else:
@@ -1735,8 +1727,9 @@ class MainWindow(QMainWindow):
         self.record.generated_fraction = self.generator.fraction_done()
         if self.record.generated_fraction >= 1:
             self.record.generation_start = -1
-            self.statusBar().showMessage("All the audio is ready. Export MP3 saves the book as one file.", 10000)
+            self.statusBar().showMessage("All the audio is ready. Export Audio saves it as M4B or MP3.", 10000)
         self._save_record()
+        self._export_when_done()
         if issues:
             self._report_issues(issues)
 
@@ -1786,7 +1779,6 @@ class MainWindow(QMainWindow):
                 self._refresh_transport()
                 self._show_generation_state()
                 self._refresh_audio_pages()
-                self._after_generation_only()
         if self._worker is None and not self._retiring:
             self._keep_awake.release()
         worker.deleteLater()
@@ -1842,12 +1834,7 @@ class MainWindow(QMainWindow):
         self.cancel_button.setVisible(running and not exporting and audio)
         self.cancel_button.setEnabled(True)
         self.export_button.setVisible(done and not running and not exporting and audio)
-        self.export_button.setText("Export M4B" if self.settings.export_format == "m4b" else "Export MP3")
-        self.export_more.setVisible(self.export_button.isVisible())
-        for action in self.export_actions.values():
-            action.setEnabled(has_book and audio and not exporting)
-        for key in ("mp3", "m4b"):
-            self.export_actions[key].setEnabled(has_book and audio and done and not exporting)
+        self.export_action.setEnabled(has_book and audio and bool(self.order) and not exporting)
         self.generation_only_action.setEnabled(has_book and audio and bool(self.order) and not done)
         self.player_only_action.setEnabled(has_book and audio)
         self.player_button.setVisible(audio)
@@ -2219,12 +2206,12 @@ class MainWindow(QMainWindow):
         if self.book is None:
             return
         popover = ThemesPopover(
-            self, self.theme.key, layout=self._layout_mode(), highlight=self.settings.highlight,
+            self, self.theme.key, override=self._styles().overridden(), highlight=self.settings.highlight,
             page_view=self.settings.page_view, highlight_unit=self.settings.highlight_unit,
         )
         popover.theme_chosen.connect(self._apply_theme)
         popover.text_size_step.connect(self._step_text_size)
-        popover.layout_chosen.connect(self._set_layout)
+        popover.override_toggled.connect(self._set_override)
         popover.highlight_toggled.connect(self._on_highlight_toggled)
         popover.page_view_chosen.connect(lambda mode: self._change_setting("page_view", mode))
         popover.highlight_unit_chosen.connect(lambda unit: self._change_setting("highlight_unit", unit))
@@ -2244,11 +2231,13 @@ class MainWindow(QMainWindow):
             self.view.set_scale(zoom)
             self.statusBar().showMessage(f"Zoom: {round(zoom * 100)}%", 3000)
         else:
-            current = min(REFLOW_SIZES, key=lambda s: abs(s - self.settings.reflow_font_size))
+            styles = self._styles()
+            current = min(REFLOW_SIZES, key=lambda s: abs(s - styles.get("reflow_font_size")))
             size = REFLOW_SIZES[max(0, min(len(REFLOW_SIZES) - 1, REFLOW_SIZES.index(current) + step))]
-            if size == self.settings.reflow_font_size:
+            if size == styles.get("reflow_font_size"):
                 return
-            self.settings.reflow_font_size = size
+            styles.set("reflow_font_size", size)
+            self._save_record()
             self.view.set_scale(size)
             self.statusBar().showMessage(f"Text size: {size} pt", 3000)
         self.settings.save()
@@ -2256,12 +2245,22 @@ class MainWindow(QMainWindow):
             block, start, end = self._highlight
             QTimer.singleShot(0, self, lambda: self.view.scroll_to(block, start, animate=False) if self.view else None)
 
-    def _set_layout(self, mode: str):
-        """Aa ▸ Layout: swap the view, keeping the position and the highlight."""
-        if self.book is None or mode == self._layout_mode():
+    def _set_override(self, on: bool):
+        """Aa ▸ Override book layout, for this book."""
+        if self.book is None:
             return
-        self.record.layout = mode
+        self._styles().set_overridden(on)
+        self._relayout_book()
+
+    def _relayout_book(self):
+        """The layout may have changed (Override book layout): swap the view if it did,
+        keeping the position and the highlight."""
+        if self.book is None:
+            return
         self._save_record()
+        shown = self._views.get(self.view) if self.view is not None else None
+        if shown is not None and shown[1] == self._layout_mode():
+            return  # (setup_view would keep the same view anyway)
         self._told_missing = ""  # asked for its pages: say again if they can't be shown
         highlight = self._highlight
         self._setup_view()
@@ -2271,9 +2270,12 @@ class MainWindow(QMainWindow):
     # ---------- settings ----------
 
     def open_settings(self):
-        """Settings… (⌘,): every change applies at once."""
-        dialogs.SettingsDialog.ask(self, self.settings, self._on_setting_changed, add_font=self._add_font)
+        """Settings… (⌘,): every change applies at once; with a book open, Font and Layout
+        are that book's (or everyone's, with "Set as default for all books")."""
+        dialogs.SettingsDialog.ask(self, self.settings, self._on_setting_changed, add_font=self._add_font,
+                                   styles=self._styles() if self.book is not None else None)
         self.settings.save()
+        self._save_record()
 
     def _add_font(self) -> list[str]:
         path, _ = QFileDialog.getOpenFileName(self, "Add a Font", "", "Fonts (*.ttf *.otf *.ttc)")
@@ -2292,7 +2294,13 @@ class MainWindow(QMainWindow):
     def _on_setting_changed(self, field: str):
         """A setting changed (the Settings window, Aa, the library's ☰): apply it now."""
         s = self.settings
-        if field in STYLE_FIELDS:
+        if field == "override":
+            self._relayout_book()
+            for view in (self.reflow_view, self.page_view):
+                if view is not None:
+                    view.set_style(self._reading_style())
+            self._after_relayout()
+        elif field in STYLE_FIELDS:
             for view in (self.reflow_view, self.page_view):
                 if view is not None:
                     view.set_style(self._reading_style())
@@ -2304,7 +2312,7 @@ class MainWindow(QMainWindow):
             self._after_relayout()
         elif field == "reflow_font_size":
             if self.reflow_view is not None:
-                self.reflow_view.set_scale(s.reflow_font_size)
+                self.reflow_view.set_scale(self._styles().get("reflow_font_size"))
             self._after_relayout()
         elif field == "theme":
             self._apply_theme(s.theme)
@@ -2322,6 +2330,7 @@ class MainWindow(QMainWindow):
             self._page_count_timer.start()
             self._update_reading_info()
         s.save()
+        self._save_record()
 
     def _set_read_aloud(self, on: bool):
         """Read aloud on or off. Off, LivroSound is an e-reader: playback stops, a running
@@ -2340,11 +2349,17 @@ class MainWindow(QMainWindow):
         self._place_overlays()
 
     def _reading_style(self) -> ReadingStyle:
-        s = self.settings
+        """The book's style with Override book layout on; else the book's own type at the
+        default width (the file decides the rest)."""
+        styles = self._styles()
+        if not styles.overridden():
+            return ReadingStyle(width=self.settings.text_width)
+        g = styles.get
         return ReadingStyle(
-            family=s.font_family, weight=s.font_weight, line_spacing=s.line_spacing,
-            paragraph_spacing=s.paragraph_spacing, word_spacing=s.word_spacing, letter_spacing=s.letter_spacing,
-            justify=s.justify, margin_left=s.margin_left, margin_right=s.margin_right, max_column=s.max_column,
+            family=g("font_family"), weight=g("font_weight"), line_spacing=g("line_spacing"),
+            paragraph_spacing=g("paragraph_spacing"), word_spacing=g("word_spacing"),
+            letter_spacing=g("letter_spacing"), justify=g("justify"), margin_left=g("margin_left"),
+            margin_right=g("margin_right"), width=g("text_width"),
         )
 
     def _after_relayout(self):
@@ -2597,7 +2612,7 @@ class MainWindow(QMainWindow):
         if self.book is None or self.view is None:
             return ""
         parts = []
-        if self.settings.show_page_numbers:
+        if self.settings.show_page_numbers and not self.view.paged():  # paged: on the page itself
             info = self.view.page_info()
             if info is not None:
                 first, last, total = info
@@ -2633,65 +2648,6 @@ class MainWindow(QMainWindow):
         self.settings.highlight = on
         self.settings.save()
         self._apply_highlight_setting()
-
-    # ---------- Choose a Layout previews ----------
-
-    def _layout_previews(self, book: Book) -> tuple[QPixmap | None, QPixmap | None]:
-        """Real thumbnails for LayoutDialog's two cards where they're cheap to make: the
-        book's opening page, as printed and in LivroSound's layout."""
-        start = _opening_block(book)
-        original = reflow = None
-        try:
-            if book.source_kind == "pdf":
-                original = self._pdf_preview(book, start)
-            elif len(book.original_html) <= 400_000:
-                original = self._reflow_preview(book, start, "original")
-        except Exception:  # a preview is a nicety: the card draws a sketch instead
-            original = None
-        try:
-            reflow = self._reflow_preview(book, start, "livrosound")
-        except Exception:
-            reflow = None
-        return original, reflow
-
-    def _reflow_preview(self, book: Book, start: int, mode: str) -> QPixmap:
-        view = ReflowView()
-        try:
-            view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-            # Shown (off screen), so it gets its size before laying out and scrolling.
-            view.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen)
-            view.resize(PREVIEW_SIZE)
-            view.show()
-            view.set_theme(self.theme)
-            if mode == "livrosound":  # the opening, at the top of the page
-                view.set_book(dataclasses.replace(book, blocks=book.blocks[start : start + 30], toc=[]), mode)
-            else:
-                view.set_book(book, mode)
-                view.scroll_to(start, animate=False)
-                bar = view.verticalScrollBar()
-                bar.setValue(bar.value() + PREVIEW_SIZE.height() // 2 - 80)  # centered → near the top
-            return view.grab()
-        finally:
-            view.deleteLater()
-
-    def _pdf_preview(self, book: Book, start: int) -> QPixmap | None:
-        import pymupdf
-
-        block = book.blocks[start]
-        page_index = block.page if block.page >= 0 else (block.words[0][0] if block.words else 0)
-        with pymupdf.open(book.source_path) as doc:
-            page = doc[page_index]
-            clip = page.rect
-            if book.text_box is not None:
-                x0, y0, x1, y1 = book.text_box
-                mx, my = (x1 - x0) * 0.06, (y1 - y0) * 0.06
-                clip = pymupdf.Rect(x0 - mx, y0 - my, x1 + mx, y1 + my) & page.rect
-            zoom = 2 * PREVIEW_SIZE.width() / max(1.0, clip.width)
-            pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), clip=clip, annots=False, alpha=False)
-            image = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888).copy()
-        pixmap = QPixmap.fromImage(image)
-        pixmap.setDevicePixelRatio(2.0)
-        return pixmap
 
     # ---------- export ----------
 
@@ -2757,12 +2713,47 @@ class MainWindow(QMainWindow):
         if not self._closing:
             self._save_ready_chapters()  # the next chapter waiting to be saved
 
-    # ---------- export chapter by chapter ----------
+    # ---------- Export Audio ----------
 
-    def export_chapters(self):
-        """Export Chapters…: pick chapters; those without audio are made first (only them),
-        and each is saved as its own file as soon as it's ready."""
-        if self.book is None or not self.order or not self.settings.read_aloud:
+    def _export_folder(self) -> str:
+        return self.settings.export_folder or str(Path.home() / "Music")
+
+    def _keep_plan(self, plan: dict):
+        """Remember what to save at 100% (the Generate pop-up's Export the audio), and the
+        format and folder for next time."""
+        if self.record is None:
+            return
+        self.record.auto_export = dict(plan)
+        if plan:
+            self.settings.export_format, self.settings.export_folder = plan["format"], plan["folder"]
+            self.settings.save()
+        self._save_record()
+
+    def _export_when_done(self):
+        """At 100%, save the audio the book's plan asks for, without asking where."""
+        rec = self.record
+        if rec is None or not rec.auto_export or self.generator is None or self.generator.fraction_done() < 1:
+            return
+        plan, rec.auto_export = dict(rec.auto_export), {}
+        self._save_record()
+        fmt, folder = plan.get("format", "m4b"), Path(plan.get("folder") or self._export_folder())
+        if plan.get("chapters"):
+            chapters = export.chapter_blocks(self.book, self.order)
+            self._chapter_jobs = [(i + 1, title, blocks) for i, (_, title, blocks) in enumerate(chapters)]
+            self._chapter_target = (fmt, folder / _file_name(self.book.title), len(chapters))
+            self._save_ready_chapters()
+            where = folder / _file_name(self.book.title)
+        else:
+            target = folder / f"{_file_name(self.book.title)}.{fmt}"
+            QTimer.singleShot(0, self, lambda: self.export(fmt, str(target)))
+            where = target
+        self.generation_page.saved.setText(f"Saving in {where}…")
+
+    def export_audio(self):
+        """Export Audio: M4B or MP3, the whole book or chapter by chapter, into a folder.
+        What isn't made yet is made first (only the chosen chapters' audio), and each file
+        is saved as soon as its audio is ready."""
+        if self.book is None or not self.order or not self.settings.read_aloud or self._export is not None:
             return
         book = self.book
         chapters = export.chapter_blocks(book, self.order)
@@ -2773,20 +2764,34 @@ class MainWindow(QMainWindow):
             ms = sum(durations.get(b, self.weights.get(b, 1) / estimate.NARRATION_CHARS_PER_S * 1000) for b in blocks)
             rows.append((title, estimate.duration_text(ms / 1000), all(b in made for b in blocks)))
 
-        def eta(indices: list[int]) -> str:
-            chars = sum(self.weights.get(b, 1) for i in indices for b in chapters[i][2] if b not in made)
+        def eta(indices: list[int] | None) -> str:
+            blocks = self.order if indices is None else [b for i in indices for b in chapters[i][2]]
+            chars = sum(self.weights.get(b, 1) for b in blocks if b not in made)
             normal, _ = self._rates()
             return f"about {estimate.duration_text(chars / normal)}"
 
-        folder = str(Path.home() / "Music" / _file_name(book.title))
-        answer = dialogs.ChapterExportDialog.ask(self, rows, self.settings.export_format, folder, eta=eta)
+        ready = self.generator.fraction_done() >= 1
+        answer = dialogs.ExportAudioDialog.ask(self, rows, self.settings.export_format, self._export_folder(),
+                                               book_ready=ready, eta=eta)
         if answer is None or not self._still(book):
             return
-        chosen, fmt, folder = answer
-        self.settings.export_format = fmt
+        mode, chosen, fmt, folder = answer
+        self.settings.export_format, self.settings.export_folder = fmt, folder
         self.settings.save()
+        if mode == "book":
+            if ready:
+                self.export(fmt, str(Path(folder) / f"{_file_name(book.title)}.{fmt}"))
+                return
+            self._keep_plan({"format": fmt, "folder": folder})
+            if not self._engine_ready():
+                if not self._choose_voice() or not self._still(book) or not self._use_chosen_voice(replace=False):
+                    return
+            if not self._generating():
+                self._start_generation(self._position_block_or_first(), fresh=False, move=False)
+            self.statusBar().showMessage("Making the rest of the audio; it's saved by itself when it's done.", 10000)
+            return
         self._chapter_jobs = [(i + 1, chapters[i][1], chapters[i][2]) for i in chosen]
-        self._chapter_target = (fmt, Path(folder), len(chapters))
+        self._chapter_target = (fmt, Path(folder) / _file_name(book.title), len(chapters))
         missing = [b for _, _, blocks in self._chapter_jobs for b in blocks if b not in made]
         if missing:
             if not self._engine_ready():
@@ -2927,7 +2932,9 @@ class MainWindow(QMainWindow):
             return
         self.player.pause()
         self._generation_only = True
-        self.generation_page.set_book(self.record, self._after_generation)
+        plan = self.record.auto_export
+        after = "nothing" if not plan else ("chapters" if plan.get("chapters") else plan.get("format", "m4b"))
+        self.generation_page.set_book(self.record, after)
         self.pages.setCurrentWidget(self.generation_page)
         self.toolbar.hide()
         self.statusBar().hide()
@@ -2969,24 +2976,15 @@ class MainWindow(QMainWindow):
             self._meter = estimate.RateMeter() if self._worker is not None else None
 
     def _set_after_generation(self, choice: str):
-        self._after_generation = choice
-
-    def _after_generation_only(self):
-        """Generation-only reached 100%: save what was asked for, without asking where."""
-        if not self._generation_only or self.generator is None or self.generator.fraction_done() < 1:
-            return
-        choice, self._after_generation = self._after_generation, "nothing"
-        folder = Path.home() / "Music"
-        if choice in ("mp3", "m4b"):
-            target = folder / f"{_file_name(self.book.title)}.{choice}"
-            self.export(choice, str(target))
-            self.generation_page.saved.setText(f"Saving “{target.name}” in {folder}…")
-        elif choice == "chapters":
-            chapters = export.chapter_blocks(self.book, self.order)
-            self._chapter_jobs = [(i + 1, title, blocks) for i, (_, title, blocks) in enumerate(chapters)]
-            self._chapter_target = (self.settings.export_format, folder / _file_name(self.book.title), len(chapters))
-            self._save_ready_chapters()
-            self.generation_page.saved.setText(f"Saving the chapters in {folder / _file_name(self.book.title)}…")
+        """The generation page's "When it's done, save:" — the book's export plan."""
+        if choice == "nothing":
+            self._keep_plan({})
+        else:
+            fmt = choice if choice in ("mp3", "m4b") else self.settings.export_format
+            plan = {"format": fmt, "folder": self._export_folder()}
+            if choice == "chapters":
+                plan["chapters"] = True
+            self._keep_plan(plan)
 
     def _chapter_lengths(self) -> tuple[list[float], dict[int, float]]:
         """Each player chapter's length (ms; estimated where audio isn't made yet), and each block's."""

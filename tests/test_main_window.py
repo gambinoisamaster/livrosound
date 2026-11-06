@@ -120,14 +120,25 @@ class Script:
         self.customize = "generate"
         self.file = ""
         self.save_as = ""
+        self.export_plan: dict = {}  # the Generate pop-up's "Export the audio" (off unless a test sets it)
+        self.export_answer = None  # what Export Audio answers; None = the book, as save_as names it
         self.windows: list[tuple[MainWindow, HeldEngine]] = []
         monkeypatch.setattr(mw, "confirm", self._confirm)
         monkeypatch.setattr(mw, "inform", lambda parent, title, text: self.informed.append((title, text)))
-        monkeypatch.setattr(dialogs.LayoutDialog, "ask", lambda *a, **k: self.layout)
         monkeypatch.setattr(dialogs.ChooseVoiceDialog, "ask", lambda *a, **k: self.voice)
         monkeypatch.setattr(dialogs.CustomizeAudioDialog, "ask", lambda *a, **k: self.customize)
         monkeypatch.setattr(mw.QFileDialog, "getOpenFileName", lambda *a, **k: (self.file, ""))
         monkeypatch.setattr(mw.QFileDialog, "getSaveFileName", lambda *a, **k: (self.save_as, ""))
+        monkeypatch.setattr(dialogs.GenerateAudioDialog, "ask", lambda parent, fmt, folder, **k: (
+            self._confirm(parent, "Generate audio from the beginning?", ""), dict(self.export_plan)))
+        monkeypatch.setattr(dialogs.ExportAudioDialog, "ask", self._export_audio)
+
+    def _export_audio(self, parent, rows, fmt, folder, **kwargs):
+        self.export_rows, self.export_kwargs = rows, kwargs
+        if self.export_answer is not None:
+            return self.export_answer
+        target = Path(self.save_as)
+        return "book", [], target.suffix.lstrip(".") or "m4b", str(target.parent)
 
     def _confirm(self, parent, title, text, yes="Yes", no="No", *, destructive=False):
         self.asked.append(title)
@@ -139,6 +150,8 @@ class Script:
         engine = engine or HeldEngine()
         outputs = FakeOutputs()
         window = MainWindow(engine, output_factory=outputs)
+        # New books open as their file made them unless Override book layout is the default.
+        window.settings.override_layout = self.layout == "livrosound"
         window.dings = []
         window._ding = lambda: window.dings.append(time.monotonic())
         window.resize(1100, 800)
@@ -193,6 +206,7 @@ def pick_from_library(window: MainWindow, book_id: str) -> None:
 
 def open_book(script: Script, window: MainWindow, path: Path) -> None:
     script.file = str(path)
+    window.settings.override_layout = script.layout == "livrosound"
     window.open_book_dialog()
     wait_until(lambda: window.book is not None and window._task is None, what="the book to open")
 
@@ -305,7 +319,7 @@ def test_upload_listen_navigate_restart_cancel_resume_and_export(script, tmp_pat
     record = Library.load().get(window.book.book_id)
     assert (record.generated_fraction, record.generation_start) == (1.0, -1)
 
-    # Export MP3: one playable file with the book's chapters.
+    # Export Audio as MP3: one playable file with the book's chapters.
     script.save_as = str(tmp_path / "The Long Rain.mp3")
     window.export_button.click()
     assert window.progress.isVisible() and window.progress.text().startswith("Exporting")
@@ -465,15 +479,15 @@ def test_pdf_original_layout_uses_the_page_view_and_aa_swaps_layouts(script, tmp
 
     window._open_themes()
     popover = window._themes_popover
-    assert popover.layout_buttons["original"].isChecked()
-    popover.layout_buttons["livrosound"].click()
+    assert not popover.override_switch.isChecked()
+    popover.override_switch.click()  # Override book layout: the PDF's text, set by LivroSound
     assert isinstance(window.view, ReflowView) and window.view._mode == "livrosound"
     assert window.player.position() == (block, 1500)
     assert window.view._highlight == expected
     assert window.record.layout == "livrosound"
     assert window.page_view.isHidden()
 
-    window._set_layout("original")
+    window._set_override(False)
     assert window.view is window.page_view and not window.page_view.isHidden()
     assert window.view.highlight_rects() and window._highlight == expected
     popover.close()
@@ -630,8 +644,9 @@ def test_keyboard_speed_theme_and_highlight(script, tmp_path):
     window._apply_theme("dark")
     assert window.settings.theme == "dark" and window.view._theme.key == "dark"
     size = window.settings.reflow_font_size
-    window._step_text_size(1)
-    assert window.settings.reflow_font_size == size + 2 and window.view._size == size + 2
+    window._step_text_size(1)  # this book's size (the defaults are Settings' "Set as default")
+    assert window.record.style["reflow_font_size"] == size + 2 and window.view._size == size + 2
+    assert window.settings.reflow_font_size == size
 
     window._on_highlight_toggled(False)
     assert window.view._highlight is None and not window.settings.highlight
@@ -666,24 +681,6 @@ def test_removing_the_open_book_from_the_library_closes_it(script, tmp_path, mon
     assert window.book is None and window.pages.currentWidget() is window.library_page
     assert Library.load().get(book_id) is None and not paths.book_dir(book_id).exists()
     assert window.library_page.empty.isVisible() and not window.library_page.book_button.isVisible()
-
-
-# ---------- Choose a Layout gets real previews ----------
-
-
-@pytest.mark.parametrize("kind", ["txt", "epub", "pdf"])
-def test_layout_dialog_gets_previews_of_the_books_opening(script, tmp_path, monkeypatch, kind):
-    window, _, _ = script.window()
-    seen = []
-    monkeypatch.setattr(dialogs.LayoutDialog, "ask", lambda parent, book, *previews: seen.append(previews))
-    script.voice = None
-    path = {"txt": write_txt, "epub": make_epub3, "pdf": _converted_ebook}[kind](tmp_path)
-    open_book(script, window, path)
-    (original, reflow), = seen
-    for pixmap in (original, reflow):
-        assert pixmap is not None and not pixmap.isNull()
-        size = pixmap.deviceIndependentSize()
-        assert 200 < size.width() and 200 < size.height()
 
 
 # ---------- imports that take a while, re-imports, failures ----------
@@ -798,8 +795,8 @@ class SlowEngine(FakeEngine):
 
 app = QApplication(sys.argv)
 mw.confirm = lambda *a, **k: True
-dialogs.LayoutDialog.ask = staticmethod(lambda *a, **k: "livrosound")
 dialogs.ChooseVoiceDialog.ask = staticmethod(lambda *a, **k: "Aaron")
+dialogs.GenerateAudioDialog.ask = staticmethod(lambda *a, **k: (True, {{}}))
 dialogs.CustomizeAudioDialog.ask = staticmethod(lambda *a, **k: "generate")
 window = mw.MainWindow(SlowEngine(), output_factory=FakeOutputs())
 window.show()
@@ -918,7 +915,7 @@ def test_quit_during_an_import_shows_nothing_and_starts_nothing(script, tmp_path
 
     monkeypatch.setattr(mw, "load_book", slow_load)
     layouts = []
-    monkeypatch.setattr(dialogs.LayoutDialog, "ask", lambda *a, **k: layouts.append(1) or "livrosound")
+    monkeypatch.setattr(dialogs.ChooseVoiceDialog, "ask", lambda *a, **k: layouts.append(1) or "Aaron")
     script.file = str(write_txt(tmp_path))
     window.open_book_dialog()
     wait_until(importing.is_set, what="the import to start")
@@ -1029,14 +1026,14 @@ def test_export_survives_another_book_opening(script, tmp_path, monkeypatch):
     window.library_page.open_requested.emit(c_id)  # waits for C's worker
     window.library_page.back_to_book_requested.emit()  # and meanwhile A is exported
     assert window._pending_open == c_id and window.export_button.isVisible()
-    real = export_mod.export_mp3
+    real = export_mod.export_audio
 
     def slow_export(book, store, order, path, *, progress, cancelled, **kw):
         return real(book, store, order, path, progress=lambda f: (time.sleep(0.05), progress(f)),
                     cancelled=cancelled, **kw)
 
-    monkeypatch.setattr(export_mod, "export_mp3", slow_export)
-    script.save_as = str(tmp_path / "A.mp3")
+    monkeypatch.setattr(export_mod, "export_audio", slow_export)
+    script.save_as = str(tmp_path / "The Long Rain.mp3")
     window.export_button.click()
     engine.release()
     wait_until(lambda: window._export is None and window._task is None and window.book.book_id == c_id, timeout=30)
@@ -1050,7 +1047,7 @@ def test_export_survives_an_import_finishing(script, tmp_path, monkeypatch):
     script.answers["Generate audio from the beginning?"] = True
     open_book(script, window, write_txt(tmp_path, "a.txt"))
     wait_until(lambda: window._worker is None)
-    real_load, real_export = mw.load_book, export_mod.export_mp3
+    real_load, real_export = mw.load_book, export_mod.export_audio
 
     def slow_load(path, *, progress, cancelled):
         for _ in range(100):
@@ -1064,12 +1061,12 @@ def test_export_survives_an_import_finishing(script, tmp_path, monkeypatch):
                            cancelled=cancelled, **kw)
 
     monkeypatch.setattr(mw, "load_book", slow_load)
-    monkeypatch.setattr(export_mod, "export_mp3", slow_export)
+    monkeypatch.setattr(export_mod, "export_audio", slow_export)
     script.voice = None
     script.file = str(_book_c(tmp_path))
     window.open_book_dialog()
     script.save_as = str(tmp_path / "A.mp3")
-    window.export()
+    window.export("mp3")
     wait_until(lambda: window._export is None and window._task is None, timeout=30)
     assert window.book.title == "Third Book"
     assert Path(script.save_as).exists() and not script.informed
@@ -1113,7 +1110,7 @@ def test_a_missing_pdf_opens_in_the_livrosound_layout_and_says_why(script, tmp_p
     wait_until(lambda: second.book is not None and second._task is None)
     wait_until(lambda: script.informed, what="the explanation")
     assert script.informed[-1][0] == "The PDF isn't where it was."
-    assert isinstance(second.view, ReflowView) and second.record.layout == "original"
+    assert isinstance(second.view, ReflowView) and second._layout_mode() == "original"  # its choice is kept
 
 
 def test_an_unzipped_epub_folder_can_be_uploaded(script, tmp_path):
@@ -1376,7 +1373,10 @@ def test_settings_apply_live_and_the_page_line_shows_progress(script, tmp_path):
     window._count_pages()
     first, last, total = view.page_info()
     assert first == 1 and total >= 1
-    assert window.reading_info_text().startswith(f"Page 1 of {total}") and window.reading_info.isVisible()
+    assert window.reading_info_text() == "0%"  # paged: the page number is on the page ("1 / 20")
+    window._change_setting("page_view", "scroll")
+    window._count_pages()
+    assert window.reading_info_text().startswith("Page 1 of ") and window.reading_info.isVisible()
     window._change_setting("justify", True)
     window._change_setting("font_weight", 600)
     assert view._style.justify and view._style.weight == 600
@@ -1390,7 +1390,7 @@ def test_settings_apply_live_and_the_page_line_shows_progress(script, tmp_path):
     window._change_setting("custom_page", "#203040")
     window._change_setting("theme", "custom")
     assert window.theme.key == "custom" and window.theme.page == "#203040"
-    assert Library.load() is not None and mw.Settings.load().page_view == "single"
+    assert Library.load() is not None and mw.Settings.load().page_view == "scroll"
 
 
 def test_word_and_paragraph_highlighting_follow_the_audio(script, tmp_path):
@@ -1523,18 +1523,30 @@ def window_book_id(path: Path) -> str:
 # ---------- M4B, chapters, generation only, player only ----------
 
 
-def test_export_m4b_with_chapters(script, tmp_path):
+def test_export_audio_as_m4b_with_chapters(script, tmp_path):
     window, _, _ = script.window()
     script.answers["Generate audio from the beginning?"] = True
     open_book(script, window, write_txt(tmp_path))
     wait_until(lambda: window._worker is None)
-    assert window.export_actions["m4b"].isEnabled() and window.export_more.isVisible()
-    script.save_as = str(tmp_path / "Rain")
-    window.export_actions["m4b"].trigger()
+    assert window.export_button.text() == "Export Audio" and window.export_action.isEnabled()
+    script.save_as = str(tmp_path / "out" / "The Long Rain.m4b")
+    window.export_button.click()
+    assert script.export_kwargs["book_ready"]
     wait_until(lambda: window._export is None, what="the export")
-    info = ffprobe(tmp_path / "Rain.m4b")
+    info = ffprobe(tmp_path / "out" / "The Long Rain.m4b")
     assert info["chapters"] and info["format"]["format_name"].startswith("mov")
-    assert window.export_button.text() == "Export M4B"  # remembered
+    assert (window.settings.export_format, window.settings.export_folder) == ("m4b", str(tmp_path / "out"))
+
+
+def test_the_generate_question_can_plan_the_export(script, tmp_path):
+    window, _, _ = script.window()
+    script.answers["Generate audio from the beginning?"] = True
+    script.export_plan = {"format": "mp3", "folder": str(tmp_path / "saved")}
+    open_book(script, window, write_txt(tmp_path))
+    wait_until(lambda: (tmp_path / "saved" / "The Long Rain.mp3").exists() and window._export is None,
+               what="the MP3 saved by itself at 100%")
+    assert window.record.auto_export == {}  # done: not again
+    assert window.settings.export_format == "mp3"
 
 
 def _chapter_book(tmp_path: Path) -> Path:
@@ -1558,12 +1570,13 @@ def test_export_chapters_makes_only_those_and_saves_each(script, tmp_path, monke
 
     def ask(parent, rows, fmt, folder_default, **kwargs):
         seen["rows"], seen["eta"] = rows, kwargs["eta"]([1])
-        return [1], "mp3", str(folder)
+        return "chapters", [1], "mp3", str(folder)
 
-    monkeypatch.setattr(dialogs.ChapterExportDialog, "ask", ask)
+    monkeypatch.setattr(dialogs.ExportAudioDialog, "ask", ask)
     script.voice = "Aaron"
-    window.export_actions["chapters"].trigger()
+    window.export_action.trigger()
     assert [title for title, _, _ in seen["rows"]] == [c[1] for c in chapters] and seen["eta"].startswith("about")
+    folder = folder / window.book.title
     wait_until(lambda: (folder / mw.export.chapter_file_name(2, chapters[1][1], "mp3")).exists()
                and window._export is None and window._worker is None, what="chapter two's file")
     made = window.store.generated()
@@ -1584,7 +1597,7 @@ def test_generation_only_mode_makes_the_audio_and_saves_it(script, tmp_path, mon
     page = window.generation_page
     assert page.stop_button.isVisible() or not page.stop_button.isHidden()
     next(b for k, b in page.after_buttons.items() if k == "m4b").click()
-    assert window._after_generation == "m4b"
+    assert window.record.auto_export == {"format": "m4b", "folder": str(tmp_path / "Music")}
     text = window.eta_text()
     assert text.startswith("About ") and "with the book on screen" in text
     engine.release()
@@ -1631,3 +1644,29 @@ def test_time_estimates_use_what_this_mac_measured(script, tmp_path):
     text = window.eta_text()
     assert text.startswith("The rest takes about ") and "audio-generation only mode" in text
     assert mw.estimate.duration_text(chars / 30.0) in text
+
+
+# ---------- one layout: the book's own, unless overridden ----------
+
+
+def test_books_open_as_made_until_their_layout_is_overridden(script, tmp_path):
+    window, _, _ = script.window()
+    script.layout = "original"
+    script.voice = None
+    open_book(script, window, make_epub3(tmp_path))
+    assert window._layout_mode() == "original" and window.view._mode == "original"
+    assert window._reading_style() == mw.ReadingStyle(width=window.settings.text_width)
+    window._styles().set_overridden(True)  # Settings ▸ Override book layout, this book only
+    window._on_setting_changed("override")
+    assert window.view._mode == "livrosound" and window.record.layout == "livrosound"
+    styles = window._styles()
+    styles.set("line_spacing", 2.0)
+    window._on_setting_changed("line_spacing")
+    assert window.view._style.line_spacing == 2.0 and window.settings.line_spacing == 1.5
+    record = Library.load().get(window.book.book_id)
+    assert record.style == {"line_spacing": 2.0} and record.layout == "livrosound"
+    # Another book still opens as its file made it; with Set as default it would follow.
+    script.voice = None
+    open_book(script, window, write_txt(tmp_path))
+    assert window._layout_mode() == "livrosound"  # a text file has no layout of its own
+    assert window.view._style.line_spacing == 1.5 and not window._styles().overridden()

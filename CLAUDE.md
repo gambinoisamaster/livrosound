@@ -122,9 +122,10 @@ Fusion, `ui_font(13)`, `ensure_reading_fonts()`, Dock icon, `MainWindow()`):
 - `audio_pages.py` — `GenerationPage` (audio-generation only), `PlayerPage` (audio player only),
   `ChapterBar`.
 - `fonts.py` — user fonts (Add Font…) in `cache/fonts/`.
-- `dialogs.py` — `ImportProgressDialog`, `LayoutDialog`, `ChooseVoiceDialog`
+- `dialogs.py` — `ImportProgressDialog`, `ChooseVoiceDialog`
   (`ask(parent, engine, voice, …) -> voice | None`), `CustomizeAudioDialog`,
-  `BookDetailsDialog`, `SettingsDialog` (tabs, live `changed(field)`), `ChapterExportDialog`;
+  `BookDetailsDialog`, `SettingsDialog` (tabs, live `changed(field)`, Override book layout),
+  `GenerateAudioDialog` (+ export plan), `ExportAudioDialog`;
   each has `ask(...)`.
 - `reader_view.py` — the `ReaderView` mixin both views share (clicked, user_scrolled,
   auto-follow helpers, link cursor); `ensure_reading_fonts()`.
@@ -170,12 +171,13 @@ Assets: `assets/voices/` (17 voices + `voices.json` + README), `assets/icons/`
   Dedications, epigraphs, prefaces are read.
 - **Errors in the source file are not ours:** "if the mistake was with the PDF, meaning
   the original file was the problem, then don't worry about that."
-- **Layouts:** Original (PDF pages like Preview's continuous scroll, zoomed in, with a
-  highlight band; EPUB/DOCX/TXT with their own HTML) or LivroSound (Apple-Books-like,
-  Iowan / New York).
+- **One layout** (2026-11-06): a book opens as its file made it; **Override book layout**
+  (per book, or "Set as default for all books") sets it with the user's font, spacing and
+  margins. Single/double page show page sheets on paper, like Readest.
 - **Landing:** Upload New Book / Go to Library (covers, group/sort/search, tags, collections);
   opening a book restores the position.
-- **Export MP3 or M4B** with chapters at 100%; **Export Chapters** makes and saves chosen chapters.
+- **Export Audio**: M4B (default) or MP3, whole book or chosen chapters, into a chosen folder;
+  the Generate question can plan it so it's saved by itself at 100%.
 - **Aaron and Ana at the top** of the voice list (Recommended); Aaron is the default.
 - The 2026-11-05 additions (Readest-style settings, page views, highlighter units, notes,
   Look Up, Find, e-reader mode, generation-only and player-only modes): DESIGN.md "Additions".

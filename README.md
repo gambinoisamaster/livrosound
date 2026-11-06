@@ -43,18 +43,16 @@ screenplays). It is for **personal, non-commercial use** (see
   book. If the file itself has a typo or a missing word, the narrator reads
   it that way.
 
-### Two ways to see it
+### How the book looks
 
-Pick one when you open a book; switch any time from **Aa**.
-
-- **Keep Original Layout**: the book as it was designed. A PDF shows its own
-  pages in one continuous scroll, zoomed in so the text column fills the
-  window (like Preview with Continuous Scroll), with a soft highlight band over
-  the words being read. An EPUB, Word or text file keeps its own fonts and
-  formatting.
-- **LivroSound Layout**: clean, comfortable text like Apple Books, in Iowan
-  Old Style (or New York, Charter, Georgia), with a centered column, generous
-  line spacing and centered chapter headings.
+A book opens as its file made it: a PDF shows its own pages (zoomed in so the
+text column fills the window, like Preview with Continuous Scroll, with a soft
+highlight band over the words being read), and an EPUB or Word file keeps its
+own fonts and formatting. Turn on **Override book layout** (in **Aa** or
+Settings) to set it with your own font, size, spacing and margins instead;
+tick **Set as default for all books** to make your choices every book's.
+Single and double page show the book as pages lying on paper, with the
+chapter at the top and the page number at the bottom.
 
 ### Voices
 
@@ -142,7 +140,7 @@ and no voice is louder than another.
 
 ### Export
 
-When the audio reaches 100%, **Export MP3** (or **Export M4B**, an audiobook like Audible's) takes the progress bar's place; **Audio ▸ Export Chapters…** saves chosen chapters as files of their own, making only their audio first. It
+When the audio reaches 100%, **Export Audio** takes the progress bar's place: an M4B audiobook (like Audible's) or an MP3, the whole book or chosen chapters, saved where you choose. The *Generate audio from the beginning?* question can also save it by itself when the audio is done. It
 saves the whole book as one MP3 with the title and author filled in and a
 chapter marker for every chapter in the contents, so Apple Books, podcast
 apps and car stereos can skip between chapters. It's fast (a 10-hour book in
@@ -187,16 +185,16 @@ uv run main.py
 
 1. **Upload New Book** (or File ▸ Upload New Book…, ⌘O) and pick a PDF, EPUB,
    Word or text file.
-2. **Choose a Layout**: Keep Original Layout or LivroSound Layout.
-3. **Choose a Voice**: pick the narrator (▶ to listen first), then
+2. **Choose a Voice**: pick the narrator (▶ to listen first), then
    **Customize Audio**: highlight sentences, read chapter titles, read
    footnotes, the Whisper check, and the pause between paragraphs (0.2–2 s).
    **Generate Audio**. (Cancel at any step and the book opens without audio.)
-4. Answer **"Generate audio from the beginning?"**, or say No and click where
-   you want to start.
-5. Press **Play** when it turns on. Use −10/+10 sec, ⏮/⏭, the speed menu,
+3. Answer **"Generate audio from the beginning?"** (with **Export the audio**
+   on, the M4B or MP3 is saved by itself when it's done), or say No and click
+   where you want to start.
+4. Press **Play** when it turns on. Use −10/+10 sec, ⏮/⏭, the speed menu,
    Contents, or just click the text.
-6. At 100%, **Export MP3**.
+5. At 100%, **Export Audio** (M4B or MP3).
 
 Close the app whenever you like: your place is saved, and an unfinished
 generation keeps everything it made.

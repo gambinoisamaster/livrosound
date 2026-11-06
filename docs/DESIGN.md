@@ -463,7 +463,7 @@ PROGRESS_BLUES, EXPORT_BLUE, `ui_font`, `stylesheet()`, `tooltip_stylesheet()`) 
 `reading_font(size)`. Port `tests/test_theme.py` (contrast rules).
 
 `ui/widgets.py`: port Popover, ThemesPopover ("Aa": theme cards, A−/A+ size, plus a
-Layout segmented control Original | LivroSound and a Highlight switch), VoicePicker +
+Override book layout switch, page view and highlighter controls, More Settings…), VoicePicker +
 VoiceMenu (one narrator; menu grouped under "Women" / "Men" headers), VoicePreviews,
 ContentsPopover (from ScenesPopover: TOC entries indented by level, each row is a link;
 a small fern dot marks chapters whose audio is ready), PlayerCapsule (−10 sec, ⏮, ▶, ⏭,
@@ -475,8 +475,7 @@ hardcover book icon (`assets/icons/livrosound.svg`), the wordmark **LivroSound**
 tagline, and two buttons: **Upload New Book** (primary, fern) and **Go to Library**
 (secondary). Signals `upload_clicked`, `library_clicked`.
 
-`ui/dialogs.py`: `ImportProgressDialog`, `LayoutDialog` (two cards with live previews: **Keep
-Original Layout** / **LivroSound Layout**), `ChooseVoiceDialog` (window title
+`ui/dialogs.py`: `ImportProgressDialog` (**Removed 2026-11-06:** `LayoutDialog`), `ChooseVoiceDialog` (window title
 "LivroSound | Choose a Voice", title "Choose a Voice", one Narrator VoicePicker with ▶
 preview by Pocket-TTS; `ask(parent, engine, voice, …) -> voice | None`; Continue off with the
 install hint when the engine can't run), `CustomizeAudioDialog` (Highlight
@@ -553,8 +552,7 @@ calls `ensure_reading_fonts()`, sets the app name "LivroSound", Fusion style,
 
 1. **Launch** → landing page. Resume is enabled when the library has books. Menu bar:
    File (Upload New Book… ⌘O, Go to Library ⇧⌘L, Settings… ⌘,), Audio (Audio-Generation
-   Only… ⌥⌘G, Audio Player Only ⌥⌘P, Export MP3…, Export M4B Audiobook…, Export
-   Chapters…), Edit (Find… ⌘F, Find Next ⌘G, Find Previous ⇧⌘G), View (Larger / Smaller
+   Only… ⌥⌘G, Audio Player Only ⌥⌘P, Export Audio… ⇧⌘E), Edit (Find… ⌘F, Find Next ⌘G, Find Previous ⇧⌘G), View (Larger / Smaller
    Text ⌘+ / ⌘−), Help (About LivroSound, Credits).
 2. **Upload New Book** → file dialog (PDF with digital text, EPUB — also an unzipped
    .epub folder — DOCX, TXT). The file's fingerprint is taken off the UI thread; a book
@@ -563,8 +561,8 @@ calls `ensure_reading_fonts()`, sets the app name "LivroSound", Fusion style,
    (shown after 300 ms, so a cached book opens without it; Cancel). A scanned PDF is
    turned away: "Scanned books aren't supported yet." with ingest's explanation; any
    other failure: "This book couldn't be opened."
-3. `LayoutDialog` → original or LivroSound layout (default: original for a PDF, else
-   LivroSound; changeable later in "Aa").
+3. (2026-11-06) No layout question: a book opens as its file made it (PDF pages, the EPUB/DOCX's
+   own HTML; a TXT in the reading layout), unless Override book layout is on (see Additions).
 4. `ChooseVoiceDialog` (the narrator, ▶ previews; Pocket-TTS is the only engine) →
    `CustomizeAudioDialog` (Go Back returns to Choose a Voice). Cancel anywhere → the book
    is shown without audio; clicking its text later opens Choose a Voice first.
@@ -580,7 +578,7 @@ calls `ensure_reading_fonts()`, sets the app name "LivroSound", Fusion style,
    reaches 5% of the book (or the end), then enables with the ready "ding" (only for
    audio asked for in this session) and "Ready to play — generation continues in the
    background". Where audio already exists, Play is enabled at once. At 100% the bar is
-   replaced by **Export MP3** (file dialog, then made off the UI thread).
+   replaced by **Export Audio** (see Additions, 2026-11-06).
 7. **Playback**: the sentence being read is highlighted (unless Highlight is off) and
    auto-scrolled into view; through a heading's lead-in silence the last sentence stays
    lit until the heading is heard. Scrolling by hand pauses auto-follow until the next play/seek. −10 sec /
@@ -755,4 +753,41 @@ Extended APIs:
     left in book", a bar across the chapter (drag to move; un-made audio asks to make it), the
     whole book as chapter segments (click to go), speed, Chapters, the player capsule, Show Text.
 23. While any generation runs, KeepAwake holds off App Nap and idle sleep.
+
+## Revisions (2026-11-06, user's first test on the Mac)
+
+User decisions: "the whole Livrosound layout versus original is confusing... scrap that to make
+one customizable layout... first time the user imports a pdf, the app should keep whatever
+font, settings, etc the file came with but under settings, make an option 'Override book
+layout'... Below it, include an option that asks 'Set as Default for all books?' if the user
+says no, then the customization is just for that one book". Themes still tint pages with the
+override off; theme and page view stay app-wide.
+
+- **One layout.** `LayoutDialog`, its previews and Aa's Original | LivroSound control are gone.
+  `BookRecord.layout`: "" = follow `Settings.override_layout` (False by default), "original" /
+  "livrosound" = this book's own choice (old records keep theirs). The views' modes are
+  unchanged underneath ("original" = the file's layout, "livrosound" = LivroSound's typesetting).
+- **Override book layout** (Settings ▸ Font / Layout, and Aa) with **Set as default for all
+  books** under it. `library.StyleStore(settings, record)` reads/writes the per-book fields
+  (`BOOK_STYLE_FIELDS`: font family/weight/size, spacing, justify, margins, text width) into
+  `BookRecord.style`, or, with the box ticked (or no book open), into Settings; ticking it moves
+  the book's choices into Settings and clears its own. `SettingsDialog(..., styles=StyleStore)`
+  announces `changed("override")`; the style controls are off until the override is on.
+- **Text width** = `Settings.text_width` (% of the window, 85 by default) instead of a fixed
+  700 px column (`max_column` removed; `ReadingStyle.width`). Margins set by hand still win.
+- **Single / double page look like pages** (user's Readest screenshots): `ui/paper.py` —
+  `sheet_rects(width, height, pages)` (a 0.74-aspect sheet as tall as the view; two meet at the
+  spine), a seamless 1/f-noise paper texture tinted light or dark, `paint_sheet`, `paint_spine`,
+  `paint_labels` (the chapter at the top left, "24 / 254" at the bottom right; the corner pill
+  then shows only the % read). ReflowView paints the sheets and maps mouse events onto them
+  (`_flow_point`); PageView shows each printed page whole (uncropped) when paged.
+- **Generate audio from the beginning?** is `GenerateAudioDialog`: Export the audio when it's done
+  (on), Audio file format M4B (default) / MP3, Save in [Choose Folder…]. Yes/No as before; the
+  plan goes to `BookRecord.auto_export` and is carried out at 100% without asking
+  (`_export_when_done`). The generation-only page's "When it's done, save:" edits the same plan.
+- **Export Audio** (status-bar button, Audio ▸ Export Audio… ⇧⌘E) is `ExportAudioDialog`: format
+  (M4B default), Whole Book or Chapter by Chapter (tick chapters), Save in folder. A whole book not
+  finished yet is made first and saved by itself; chosen chapters are made (only those) and saved
+  one by one into `<folder>/<Book title>/`. `Settings.export_format` / `export_folder` remember the
+  last choice. Export Chapters (menu item and dialog) is gone.
 
