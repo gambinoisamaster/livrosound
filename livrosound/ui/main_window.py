@@ -7,8 +7,9 @@ Radio's main window does:
     landing  -> Upload New Book -> import thread (PDF with text, EPUB, DOCX, TXT)
              -> LayoutDialog -> ChooseVoiceDialog <-> CustomizeAudioDialog
              -> the reader -> "Generate audio from the beginning?"
-    landing  -> Resume a Previous Book -> LibraryDialog -> the reader at the
-                saved position -> "Continue generating audio?"
+    landing  -> Go to Library -> LibraryPage (covers; search, group, sort, tags,
+                collections) -> the reader at the saved position ->
+                "Continue generating audio?"
 
 The reader is a stage holding one ReaderView (PageView for a PDF in its
 original layout, ReflowView otherwise) with the player capsule and the speed
@@ -43,6 +44,8 @@ from __future__ import annotations
 
 import bisect
 import dataclasses
+import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -53,8 +56,10 @@ from PySide6.QtCore import QEvent, QPoint, QPointF, QSize, Qt, QThread, QTimer, 
 from PySide6.QtGui import (
     QAction,
     QColor,
+    QDesktopServices,
     QFont,
     QFontMetrics,
+    QGuiApplication,
     QImage,
     QKeySequence,
     QPainter,
@@ -79,7 +84,7 @@ from PySide6.QtWidgets import (
 )
 from shiboken6 import isValid
 
-from .. import export, paths
+from .. import bookinfo, export, paths, shelf
 from ..audio_store import AudioStore, Cue, cue_at
 from ..book import Book
 from ..engines import load_engines
@@ -93,6 +98,7 @@ from ..validate import Transcriber
 from . import dialogs
 from . import theme as themes
 from .landing import LivroSoundLanding
+from .library_page import LibraryPage
 from .page_view import MAX_ZOOM, MIN_ZOOM, PageView
 from .player import BookPlayer, QtSinkOutput
 from .reflow_view import ReflowView
@@ -158,6 +164,20 @@ def _spoken_before(book: Book) -> list[int]:
     return before
 
 
+def _gather_info(book: Book) -> bookinfo.BookInfo:
+    """(Off the UI thread) a new book's library info, its cover saved as cover.jpg."""
+    words = sum(len(b.text.split()) for b in book.blocks)
+    info = bookinfo.read_info(book.source_path, book.source_kind, words=words)
+    if info.cover:
+        bookinfo.save_cover(book.book_id, info.cover)
+    return info
+
+
+def _apply_info(record: BookRecord, info: bookinfo.BookInfo) -> None:
+    record.subjects, record.series, record.series_index = list(info.subjects), info.series, info.series_index
+    record.published, record.pages = info.published, info.pages
+
+
 def _opening_block(book: Book) -> int:
     """Where the book itself starts: the heading just before its first real paragraph
     (or that paragraph), past the front matter."""
@@ -170,6 +190,10 @@ def _opening_block(book: Book) -> int:
         elif block.kind == "paragraph" and len(block.text) >= 60:
             return heading if 0 <= heading and i - heading <= 4 else i
     return 0
+
+
+def _system_is_dark() -> bool:
+    return QGuiApplication.styleHints().colorScheme() == Qt.ColorScheme.Dark
 
 
 def _file_name(title: str) -> str:
@@ -260,7 +284,7 @@ class GenerationWorker(QThread):
 
 class Task(QThread):
     """A job off the UI thread: job(progress, cancelled) -> result. Used to look a file
-    over, import or load a book, and export the MP3."""
+    over, import or load a book, read the library's book info, and export the MP3."""
 
     progressed = Signal(int, int, str)
     done = Signal(object)
@@ -372,19 +396,26 @@ class MainWindow(QMainWindow):
         self._build_toolbar()
         self._build_reader()
         self._build_status_bar()
-        self.landing = LivroSoundLanding(resume_enabled=bool(self.library.recent()))
+        self.landing = LivroSoundLanding()
         self.landing.upload_clicked.connect(self.open_book_dialog)
-        self.landing.resume_clicked.connect(self.open_previous)
+        self.landing.library_clicked.connect(self.show_library)
+        self._info_task: Task | None = None  # reading the library's covers and book info
+        self._build_library_page()
         self.pages = QStackedWidget()
         self.pages.addWidget(self.landing)
+        self.pages.addWidget(self.library_page)
         self.pages.addWidget(self.reader_page)
         self.setCentralWidget(self.pages)
-        self._apply_theme(self.settings.theme)
+        self.setAcceptDrops(True)  # a book dropped on the window opens (Auto Import on File Open)
+        QGuiApplication.styleHints().colorSchemeChanged.connect(lambda _scheme: self._follow_appearance())
+        self._restyle(self._effective_theme())
         self._show_landing()
         if output_factory is None:
             # The first sound output and sound effect take a moment to open: do it now.
             QTimer.singleShot(0, self, QMediaDevices.defaultAudioOutput)
             QTimer.singleShot(0, self, self._ready_sound_effect)
+        if self.settings.open_last_book and self.library.recent():
+            QTimer.singleShot(0, self, self._open_last_book)
 
     # ---------- building ----------
 
@@ -393,11 +424,11 @@ class MainWindow(QMainWindow):
         self.upload_action = QAction("Upload New Book…", self)
         self.upload_action.setShortcut(QKeySequence(QKeySequence.StandardKey.Open))
         self.upload_action.triggered.connect(self.open_book_dialog)
-        self.resume_action = QAction("Resume a Previous Book…", self)
-        self.resume_action.setShortcut(QKeySequence("Ctrl+Shift+O"))
-        self.resume_action.triggered.connect(self.open_previous)
+        self.library_action = QAction("Go to Library", self)
+        self.library_action.setShortcut(QKeySequence("Ctrl+Shift+L"))
+        self.library_action.triggered.connect(self.show_library)
         file_menu.addAction(self.upload_action)
-        file_menu.addAction(self.resume_action)
+        file_menu.addAction(self.library_action)
         # About in the app menu (macOS moves it there), and Help ▸ Credits.
         help_menu = self.menuBar().addMenu("Help")
         about = QAction("About LivroSound", self)
@@ -442,6 +473,7 @@ class MainWindow(QMainWindow):
             tb.addWidget(button)
             return button
 
+        self.library_toolbar_action = action("Library", self.show_library)
         self.new_action = action("New Book", self.open_book_dialog)
         # Like Apple Books: a list button for the chapters, "Aa" for themes and text.
         self.contents_button = pill("Contents", "The book's chapters", self._open_contents, QSize(20, 16))
@@ -584,7 +616,6 @@ class MainWindow(QMainWindow):
     # ---------- pages ----------
 
     def _show_landing(self):
-        self.landing.set_resume_enabled(bool(self.library.recent()))
         self.pages.setCurrentWidget(self.landing)
         self.toolbar.hide()
         self.statusBar().hide()
@@ -662,12 +693,36 @@ class MainWindow(QMainWindow):
     # ---------- theme ----------
 
     def _apply_theme(self, key: str):
+        """The user chose a reading theme. With Auto Mode it becomes the theme for the
+        appearance macOS has now (light or dark)."""
+        t = theme_for(key)
+        self.settings.theme = t.key
+        if self.settings.auto_mode:
+            if _system_is_dark():
+                self.settings.dark_theme = t.key
+            else:
+                self.settings.light_theme = t.key
+        self.settings.save()
+        self._restyle(t.key)
+
+    def _effective_theme(self) -> str:
+        """The theme to show: with Auto Mode, the light or dark one for macOS's appearance."""
+        s = self.settings
+        if s.auto_mode:
+            return s.dark_theme if _system_is_dark() else s.light_theme
+        return s.theme
+
+    def _follow_appearance(self):
+        """macOS switched Light/Dark (or Auto Mode was turned on or off)."""
+        key = self._effective_theme()
+        if key != self.theme.key:
+            self._restyle(key)
+
+    def _restyle(self, key: str):
         """Restyle everything for a reading theme (see theme.py)."""
         t = theme_for(key)
         self.theme = t
         themes.set_current(t)  # before the stylesheet: painted widgets read it
-        self.settings.theme = t.key
-        self.settings.save()
         self.setStyleSheet(themes.stylesheet(t))
         palette = QPalette()
         for role, color in (
@@ -690,6 +745,8 @@ class MainWindow(QMainWindow):
         self.capsule.refresh_icons()
         self.capsule.update()
         self.landing.update()
+        self.library_page.update()
+        self.library_page.shelf.viewport().update()
         themes_popover = self._popover("_themes_popover")
         if themes_popover is not None:
             themes_popover.set_theme(t.key)
@@ -757,12 +814,16 @@ class MainWindow(QMainWindow):
         self._when_released(book_id, lambda: self._import(path, reopen))
 
     def _import(self, path: str, reopen: BookRecord | None):
-        task = Task(lambda report, cancelled: load_book(path, progress=report, cancelled=cancelled))
+        def job(report, cancelled):
+            book = load_book(path, progress=report, cancelled=cancelled)
+            return book, _gather_info(book)
+
+        task = Task(job)
         close_progress = self._progress_for(task, f"Reading “{Path(path).stem}”")
 
-        def done(book: Book):
+        def done(result: tuple[Book, bookinfo.BookInfo]):
             close_progress()
-            self._when_no_dialog(lambda: self._on_imported(book))
+            self._when_no_dialog(lambda: self._on_imported(*result))
 
         def failed(message: str):
             close_progress()
@@ -840,13 +901,17 @@ class MainWindow(QMainWindow):
         if task is self._task:
             self._task = None
 
-    def _on_imported(self, book: Book):
+    def _on_imported(self, book: Book, info: bookinfo.BookInfo | None = None):
         """Flows 3–5 for a freshly imported book."""
         self._close_book()
         record = self.library.get(book.book_id) or BookRecord(
             book.book_id, book.title, book.author, book.source_path, book.source_kind,
-            layout="original" if book.source_kind == "pdf" else "livrosound",
+            layout="original" if book.source_kind == "pdf" else "livrosound", date_added=_now(),
         )
+        if info is not None:
+            _apply_info(record, info)
+            record.info_version = bookinfo.INFO_VERSION
+            self.library_page.cover_changed(book.book_id)
         record.title, record.author = book.title, book.author
         record.source_path, record.source_kind = book.source_path, book.source_kind
         layout = dialogs.LayoutDialog.ask(self, book, *self._layout_previews(book))
@@ -863,28 +928,196 @@ class MainWindow(QMainWindow):
         if self._use_chosen_voice(replace=False):
             self._ask_where_to_start()
 
-    # ---------- resuming a book ----------
+    # ---------- the library ----------
 
-    def open_previous(self):
-        """Resume a Previous Book (flow 9)."""
-        if self._busy():
-            return
-        book_id = dialogs.LibraryDialog.ask(self, self.library, self._remove_book)
+    def _build_library_page(self):
+        page = LibraryPage(self.library, self.settings)
+        page.open_requested.connect(self._open_from_library)
+        page.upload_requested.connect(self.open_book_dialog)
+        page.home_requested.connect(self._show_landing)
+        page.back_to_book_requested.connect(self._show_reader)
+        page.remove_requested.connect(self._ask_to_remove)
+        page.details_requested.connect(self._show_details)
+        page.reveal_requested.connect(self._reveal)
+        page.about_requested.connect(lambda: QMessageBox.about(self, "About LivroSound", ABOUT_HTML))
+        page.option_toggled.connect(self._on_app_option)
+        page.changed.connect(self._save_library_and_settings)
+        self.library_page = page
+
+    def show_library(self):
+        """Go to Library (flow 9): every book as a cover, the open book still open (unless
+        it was removed from the library meanwhile: then it closes and stays gone)."""
         if self.book is not None and self.library.get(self.book.book_id) is None:
-            # The open book was just removed from the library (its files are gone).
             self._close_book(save=False)
-            self._show_landing()
-        self.landing.set_resume_enabled(bool(self.library.recent()))
-        record = self.library.get(book_id) if book_id else None
-        if record is not None:
+        self.library_page.set_book_open(self.book.title if self.book is not None else "")
+        self.library_page.refresh()
+        self.pages.setCurrentWidget(self.library_page)
+        self.toolbar.hide()
+        self.statusBar().hide()
+        self._set_title("")
+        self._refresh_library_info()
+
+    def _save_library_and_settings(self):
+        self.settings.save()
+        self.library.save()
+
+    def _open_from_library(self, book_id: str):
+        record = self.library.get(book_id)
+        if record is not None and not self._busy():
             self._resume(record)
 
+    def _open_last_book(self):
+        """Open Last Book on Start."""
+        recent = self.library.recent()
+        if recent and self.book is None and not self._busy():
+            self._resume(recent[0])
+
+    def _ask_to_remove(self, book_ids: list[str]):
+        """Remove from Library: asks, then closes the book if it's open and deletes its
+        text and audio (never the user's file)."""
+        records = [r for r in (self.library.get(b) for b in book_ids) if r is not None]
+        if not records:
+            return
+        if len(records) == 1:
+            title = f"Remove “{records[0].title}” from your library?"
+            text = "Its text and audio are deleted from this Mac. Your file stays where it is."
+        else:
+            title = f"Remove {len(records)} books from your library?"
+            text = "Their text and audio are deleted from this Mac. Your files stay where they are."
+        if not confirm(self, title, text, yes="Remove", no="Cancel", destructive=True):
+            return
+        for record in records:
+            self._remove_book(record.book_id)
+        self.library_page.shelf.set_selecting(False)
+        self.library_page.set_book_open(self.book.title if self.book is not None else "")
+        self.library_page.refresh()
+
+    def _show_details(self, book_id: str):
+        record = self.library.get(book_id)
+        if record is None:
+            return
+        records = self.library.recent()
+        answer = dialogs.BookDetailsDialog.ask(
+            self, record, shelf.all_values(records, "tags"), shelf.all_values(records, "collections")
+        )
+        if answer is not None and self.library.get(book_id) is record:
+            record.tags, record.collections = answer
+            self.library.save()
+            self.library_page.refresh()
+
+    def _reveal(self, book_id: str):
+        """Show in Finder: the book's file, selected in its folder."""
+        record = self.library.get(book_id)
+        path = Path(record.source_path) if record is not None and record.source_path else None
+        if path is None or not path.exists():
+            inform(self, "The file isn't where it was.", f"LivroSound can't find {path or 'it'}.")
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", str(path)])
+        else:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent)))
+
+    def _on_app_option(self, field: str, on: bool):
+        """The library's ☰ menu: Auto Mode restyles at once; the others apply where they're used."""
+        if field == "auto_mode":
+            self._follow_appearance()
+
+    def _refresh_library_info(self):
+        """Read covers and book info (subjects, series, pages, length) for books that lack
+        them, off the UI thread; each book's tile updates as it's read."""
+        if self._info_task is not None or self._closing:
+            return
+        todo = [
+            (r.book_id, r.source_path, r.source_kind)
+            for r in self.library.recent()
+            if r.info_version < bookinfo.INFO_VERSION
+        ]
+        if not todo:
+            return
+        results: dict[str, tuple] = {}
+
+        def job(report, cancelled):
+            for i, (book_id, source, kind) in enumerate(todo):
+                if cancelled():
+                    break
+                book = Book.load(paths.book_dir(book_id))
+                words = sum(len(b.text.split()) for b in book.blocks) if book is not None else 0
+                info = bookinfo.read_info(source, kind, words=words) if source and Path(source).exists() else None
+                if info is not None and info.cover:
+                    bookinfo.save_cover(book_id, info.cover)
+                results[book_id] = (info, _spoken_before(book) if book is not None else None)
+                report(i + 1, len(todo), book_id)
+
+        task = Task(job)
+        self._info_task = task
+        self._threads.add(task)
+        task.progressed.connect(lambda _done, _total, book_id: self._apply_book_info(book_id, *results.pop(book_id)))
+        task.finished.connect(lambda: self._on_info_finished(task))
+        task.start()
+
+    def _apply_book_info(self, book_id: str, info: bookinfo.BookInfo | None, before: list[int] | None):
+        record = self.library.get(book_id)
+        if record is None or self._closing:
+            return
+        if info is not None:
+            _apply_info(record, info)
+        if before is not None:
+            record.spoken_chars = before[-1]
+            if record.read_fraction < 0 and before[-1]:
+                record.read_fraction = before[min(max(record.position_block, 0), len(before) - 1)] / before[-1]
+        record.info_version = bookinfo.INFO_VERSION
+        self.library_page.cover_changed(book_id)
+
+    def _on_info_finished(self, task: Task):
+        self._threads.discard(task)
+        task.deleteLater()
+        if task is self._info_task:
+            self._info_task = None
+        if not self._closing:
+            self.library.save()
+            self.library_page.refresh()
+
+    # ---------- books from Finder ----------
+
+    def open_external(self, path: str):
+        """A book opened with LivroSound from Finder (or dropped on the window): imported
+        at once with Auto Import on File Open, else after asking."""
+        if self._closing:
+            return
+        name = Path(path).name
+        if not self.settings.auto_import and not confirm(
+            self, f"Add “{name}” to your library?", "LivroSound reads it and keeps it with your other books.",
+            yes="Add", no="Cancel",
+        ):
+            return
+        self._when_no_dialog(lambda: self.open_path(path))
+
+    def dragEnterEvent(self, event):
+        if self._dropped_book(event.mimeData()) is not None:
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        path = self._dropped_book(event.mimeData())
+        if path is not None:
+            event.acceptProposedAction()
+            QTimer.singleShot(0, self, lambda: self.open_external(path))
+
+    @staticmethod
+    def _dropped_book(mime) -> str | None:
+        for url in mime.urls() if mime.hasUrls() else []:
+            path = Path(url.toLocalFile())
+            if path.suffix.lower() in SUPPORTED_SUFFIXES:
+                return str(path)
+        return None
+
+    # ---------- resuming a book ----------
+
     def _remove_book(self, book_id: str):
-        """Remove from Library (LibraryDialog asked first): an open book is closed first,
+        """Remove from Library (the user was asked first): an open book is closed first,
         and its files are deleted only once no worker writes to them any more."""
         if self.book is not None and self.book.book_id == book_id:
             self._close_book(save=False)
-            self._show_landing()
+            if self.pages.currentWidget() is self.reader_page:
+                self._show_landing()
         self.library.remove(book_id, delete_files=False)
         self.library.save()
         self._when_released(book_id, lambda: self.library.remove(book_id), opening=False)
@@ -970,6 +1203,7 @@ class MainWindow(QMainWindow):
             record.audio_signature = self.store.signature
             record.generated_fraction, record.generation_start = 0.0, -1
         self._before = _spoken_before(book)
+        record.spoken_chars = self._before[-1]
         self._cues.clear()
         self._gate = self._pending_char = None
         self._pick_mode = self._at_end = False

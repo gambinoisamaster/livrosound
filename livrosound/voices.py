@@ -8,6 +8,8 @@ leveled on output (loudness.py).
 
 voices.json adds what a .wav can't say: gender and age, so Choose a Voice can
 group the narrators (Women, Men) and order each group young -> adult -> mature.
+FEATURED (Aaron, the default, and Ana) head the list in a group of their own
+(user requirement: "Aaron and Ana must be at top of the list").
 A sample without an entry still appears, under "Other". Keys starting with "_"
 are comments.
 
@@ -28,6 +30,8 @@ DEFAULT_VOICE = "Aaron"
 VOICES_DIR = paths.VOICES_DIR  # read at call time, so a test can point it elsewhere
 METADATA_FILE = "voices.json"
 
+FEATURED = ("Aaron", "Ana")
+FEATURED_GROUP = "Recommended"
 GROUPS = (("female", "Women"), ("male", "Men"))
 OTHER_GROUP = "Other"
 AGE_ORDER = ("young", "adult", "mature")  # unknown ages sort after these
@@ -70,13 +74,20 @@ def voice_named(name: str) -> Voice | None:
 
 
 def grouped() -> list[tuple[str, list[Voice]]]:
-    """[("Women", ...), ("Men", ...), ("Other", ...)], empty groups left out; each
-    group ordered young -> adult -> mature, then by name."""
+    """[("Recommended", [Aaron, Ana]), ("Women", ...), ("Men", ...), ("Other", ...)],
+    empty groups left out; each gender group ordered young -> adult -> mature, then by name."""
     voices = catalog()
+    featured = [v for name in FEATURED for v in voices if v.name == name]
+    voices = [v for v in voices if v not in featured]
     known = {gender for gender, _ in GROUPS}
-    groups = [(label, [v for v in voices if v.gender == gender]) for gender, label in GROUPS]
+    groups = [(FEATURED_GROUP, featured)]
+    groups += [(label, [v for v in voices if v.gender == gender]) for gender, label in GROUPS]
     groups.append((OTHER_GROUP, [v for v in voices if v.gender not in known]))
-    return [(label, sorted(members, key=_age_then_name)) for label, members in groups if members]
+    return [
+        (label, members if label == FEATURED_GROUP else sorted(members, key=_age_then_name))
+        for label, members in groups
+        if members
+    ]
 
 
 def _age_then_name(voice: Voice) -> tuple[int, str]:

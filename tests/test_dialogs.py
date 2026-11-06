@@ -221,8 +221,8 @@ def test_choose_voice_layout(host, renders):
     assert dialog.subtitle_label.text() == "Pick the narrator who will read your book aloud."
     assert dialog.choice() == "Aaron" and dialog.continue_button.isEnabled()
     assert dialog.note.isHidden()
-    # Grouped like voices.grouped(), only the engine's voices: Women (young first), then Men.
-    assert _picker_rows(dialog) == [None, "Emily", "Ana", None, "Aaron"]
+    # Grouped like voices.grouped(), only the engine's voices: Aaron and Ana first, then Women, Men.
+    assert _picker_rows(dialog) == [None, "Aaron", "Ana", None, "Emily"]
     assert _wait_until(lambda: ("Pocket-TTS", "Aaron") in renders.calls)  # warmed
     dialog.picker.set_current("Emily")
     assert dialog.choice() == "Emily"
@@ -235,7 +235,7 @@ def test_choose_voice_layout(host, renders):
 
 def test_choose_voice_unknown_voice_falls_back(host, renders):
     dialog = d.ChooseVoiceDialog(host, NamedEngine("Pocket-TTS", voices=("Ana", "Emily")), "Ronald", renders)
-    assert dialog.choice() == "Emily"  # no Aaron (the default) either: the first voice listed
+    assert dialog.choice() == "Ana"  # no Aaron (the default) either: the first voice listed
     dialog.done(0)
     dialog.previews.shutdown()
 
@@ -388,123 +388,35 @@ def library():
     return lib
 
 
-def _rows(dialog) -> list[str]:
-    return [dialog.list.item(i).data(Qt.ItemDataRole.UserRole) for i in range(dialog.list.count())]
-
-
-def test_library_lists_recent_books(host, library):
-    dialog = d.LibraryDialog(host, library)
-    assert dialog.windowTitle() == "LivroSound | Your Books"
-    assert dialog.title_label.text() == "Your Books"
-    assert _rows(dialog) == ["new", "mid", "old"]
-    assert dialog.selected() == "new" and dialog.open_button.isEnabled()
-    row = dialog.list.itemWidget(dialog.list.item(1))
-    assert row.title.text() == "Artful Sentences"
-    assert row.author.text() == "An Author"
-    assert row.status.text() == "34% read · no audio yet · opened yesterday"
-    first = dialog.list.itemWidget(dialog.list.item(0))
-    assert first.status.text() == "Not started · audio 12% ready · opened today"
-    assert dialog.empty.isHidden()
-
-
-def test_library_ask(host, library, monkeypatch):
-    def open_second(dlg):
-        item = dlg.list.item(1)
-        dlg.list.setCurrentItem(item)
-        dlg.list.itemDoubleClicked.emit(item)
-
-    _answer(monkeypatch, d.LibraryDialog, open_second)
-    assert d.LibraryDialog.ask(host, library) == "mid"
-    _answer(monkeypatch, d.LibraryDialog, lambda dlg: dlg.open_button.click())
-    assert d.LibraryDialog.ask(host, library) == "new"
-    _answer(monkeypatch, d.LibraryDialog, lambda dlg: dlg.cancel_button.click())
-    assert d.LibraryDialog.ask(host, library) is None
-
-
-def test_library_remove_asks_first(host, library, monkeypatch):
-    asked = []
-    answer = {"yes": False}
-
-    def fake_alert_exec(alert):
-        asked.append(alert.title_label.text())
-        return QDialog.DialogCode.Accepted if answer["yes"] else QDialog.DialogCode.Rejected
-
-    monkeypatch.setattr(w.Alert, "exec", fake_alert_exec)
-    removed = []
-    real_remove = library.remove
-    monkeypatch.setattr(library, "remove", lambda book_id, **kw: (removed.append(book_id), real_remove(book_id, **kw)))
-    dialog = d.LibraryDialog(host, library)
-    dialog.list.setCurrentRow(1)
-
-    assert dialog.remove("mid") is False  # "Cancel"
-    assert asked == ["Remove “Artful Sentences” from your library?"]
-    assert removed == [] and library.get("mid") is not None
-
-    answer["yes"] = True
-    menu = dialog.context_menu("mid")
-    [action] = menu.actions()
-    assert action.text() == "Remove from Library…"
-    action.trigger()
-    assert removed == ["mid"]
-    assert library.get("mid") is None
-    assert not paths.book_dir("mid").exists()
-    assert Library.load().get("mid") is None  # saved
-    assert _rows(dialog) == ["new", "old"]
-    assert dialog.remove("missing") is False
-
-
-def test_library_remove_hands_the_removal_to_the_window(host, library, monkeypatch):
-    """With on_remove, the window does the removal (it may have the book open): the
-    dialog only asks first and shows the list as the window left it."""
-    monkeypatch.setattr(w.Alert, "exec", lambda alert: QDialog.DialogCode.Accepted)
-    handed = []
-
-    def on_remove(book_id):
-        handed.append(book_id)
-        library.remove(book_id, delete_files=False)  # e.g. the files go once a worker has stopped
-
-    dialog = d.LibraryDialog(host, library, on_remove)
-    assert dialog.remove("mid") is True
-    assert handed == ["mid"]
-    assert paths.book_dir("mid").exists()  # the dialog itself deleted nothing
-    assert _rows(dialog) == ["new", "old"]
-    seen = []
-    monkeypatch.setattr(d.LibraryDialog, "exec", lambda dlg: seen.append(dlg._on_remove) or QDialog.DialogCode.Rejected)
-    assert d.LibraryDialog.ask(host, library, on_remove) is None and seen == [on_remove]
-
-
-def test_library_empty_state(host):
-    dialog = d.LibraryDialog(host, Library())
-    assert dialog.list.isHidden() and not dialog.empty.isHidden()
-    assert "No books yet" in dialog.empty.text()
-    assert not dialog.open_button.isEnabled()
-    assert dialog.selected() is None
-
-
-def test_book_status_lines(library):
-    today = date(2026, 10, 23)
-    assert d.opened_text("2026-10-23T09:15:00", today) == "opened today"
-    assert d.opened_text("2026-10-22T23:59:59", today) == "opened yesterday"
-    assert d.opened_text("2026-10-02T10:00:00", today) == "opened Oct 2"
-    assert d.opened_text("2025-12-31T10:00:00", today) == "opened Dec 31, 2025"
-    assert d.opened_text("", today) == ""
-
+def test_book_details_shows_what_is_known_and_edits_tags_and_collections(host, library, monkeypatch):
     record = library.get("old")
-    assert d.read_fraction(record) == pytest.approx(0.71)  # 71 of the 100 paragraphs come before block 72
-    record.last_opened = "2026-10-22T08:00:00"
-    assert d.book_status(record, today) == "71% read · audio 100% ready · opened yesterday"
-    record.generated_fraction = 0.999
-    assert "audio 99% ready" in d.book_status(record, today)  # never 100% until it is
-    # Under 1% read: "Just started" once the position has moved at all, else "Not started".
-    started = library.get("new")
-    assert d.book_status(started, today).startswith("Not started")
-    started.position_ms = 4200  # into the first block
-    assert d.book_status(started, today).startswith("Just started")
-    started.position_ms, started.read_fraction = 0, 0.004  # a few paragraphs into a long book
-    assert d.book_status(started, today).startswith("Just started")
-    gone = BookRecord("nowhere", "Lost", "", "/x/lost.txt", "txt", generated_fraction=0.5)
-    assert d.read_fraction(gone) is None
-    assert d.book_status(gone, today) == "audio 50% ready"
+    record.pages, record.series, record.series_index = 212, "The Collected Kafka", 2
+    record.subjects, record.tags, record.collections = ["Fiction", "Law"], ["classic"], []
+    record.read_fraction, record.spoken_chars, record.voice = 0.71, 10_000, "Aaron"
+    dialog = d.BookDetailsDialog(host, record, ["classic", "to read"], ["Summer"])
+    assert dialog.title_label.text() == "The Trial"
+    rows = dict(d.detail_rows(record, date.today()))
+    assert rows["Format"] == "DOCX" and rows["Pages"] == "212"
+    assert rows["Series"] == "The Collected Kafka, book 2" and rows["Subjects"] == "Fiction, Law"
+    assert rows["Progress"].startswith("71% read · about") and rows["Audio"] == "100% made with Aaron"
+    assert "Published" not in rows  # unknown: left out
+    assert dialog.tags.text() == "classic"
+    dialog.tags.setText("classic,  to read , Classic")
+    dialog.collections.setText("Summer")
+    assert dialog.names() == (["classic", "to read"], ["Summer"])
+    _answer(monkeypatch, d.BookDetailsDialog, lambda dlg: (dlg.tags.setText("new"), dlg.save_button.click()))
+    assert d.BookDetailsDialog.ask(host, record, [], []) == (["new"], [])
+    _answer(monkeypatch, d.BookDetailsDialog, lambda dlg: dlg.cancel_button.click())
+    assert d.BookDetailsDialog.ask(host, record, [], []) is None
+
+
+def test_opened_text():
+    today = date(2026, 10, 23)
+    assert d.opened_text("2026-10-23T09:15:00", today) == "today"
+    assert d.opened_text("2026-10-22T23:59:59", today) == "yesterday"
+    assert d.opened_text("2026-10-02T10:00:00", today) == "Oct 2"
+    assert d.opened_text("2025-12-31T10:00:00", today) == "Dec 31, 2025"
+    assert d.opened_text("", today) == ""
 
 
 # ---------- every dialog in both themes ----------
@@ -522,7 +434,7 @@ def test_every_dialog_paints(host, key, library, renders):
         d.LayoutDialog(host, _book("epub")),
         voice,
         d.CustomizeAudioDialog(host, Settings(), (False, "Whisper is not installed.")),
-        d.LibraryDialog(host, library),
+        d.BookDetailsDialog(host, library.get("mid"), [], []),
     ]
     for dialog in dialogs:
         dialog.show()

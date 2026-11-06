@@ -328,6 +328,27 @@ QToolButton#roundButton:hover {{ background: {t.line}; }}
 QToolButton#pickerArrow {{ background: transparent; border: none; border-radius: 8px; }}
 QToolButton#pickerArrow:hover {{ background: {t.raised_hover}; }}
 
+QLineEdit#librarySearch {{ background: {t.raised_hover}; border: 1px solid transparent; border-radius: 16px;
+           padding: 4px 14px; }}
+QLineEdit#librarySearch:focus {{ border: 1px solid {t.line}; background: {t.raised}; }}
+QToolButton#libraryTool {{ background: transparent; color: {t.text}; border: none; border-radius: 16px; padding: 4px 12px; }}
+QToolButton#libraryTool:hover {{ background: {t.raised_hover}; }}
+QToolButton#libraryTool:disabled {{ color: {t.muted}; }}
+QLabel#libraryTitle {{ color: {t.text}; }}
+QFrame#selectionBar {{ background: {t.panel}; border: 1px solid {t.line}; border-radius: 22px; }}
+QToolButton#selectionAction {{ background: transparent; color: {t.text}; border: none; border-radius: 15px;
+           padding: 6px 12px; }}
+QToolButton#selectionAction:hover {{ background: {t.raised_hover}; }}
+QToolButton#selectionAction:disabled {{ color: {_alpha(t.muted, 0.6)}; }}
+QToolButton#menuToggle {{ background: transparent; color: {t.text}; border: none; padding: 4px 6px; }}
+QMenu {{ background: {t.panel}; color: {t.text}; border: 1px solid {t.line}; border-radius: 10px; padding: 5px; }}
+QMenu::item {{ padding: 6px 22px 6px 26px; border-radius: 6px; }}
+QMenu::item:selected {{ background: {ACCENT_HOVER}; color: {ON_ACCENT}; }}
+QMenu::item:disabled {{ color: {t.muted}; }}
+QMenu::separator {{ height: 1px; background: {t.hairline}; margin: 5px 8px; }}
+QMenu::section {{ color: {t.muted}; padding: 6px 12px 2px 12px; }}
+QMenu::indicator {{ width: 14px; left: 7px; }}
+
 QLabel#castingTitle, QLabel#alertTitle {{ color: {t.text}; }}
 QLabel#castingSubtitle, QLabel#hint, QLabel#alertText {{ color: {t.muted}; }}
 QFrame#voicePicker {{ background: {t.raised}; border: 1px solid {t.line}; border-radius: 12px; }}
