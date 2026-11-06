@@ -41,9 +41,9 @@ stylesheet: it would override the per-widget fonts.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
-from PySide6.QtGui import QFont, QFontDatabase
+from PySide6.QtGui import QColor, QFont, QFontDatabase
 
 # Qt draws square corners when a border-radius is more than half a widget's
 # height, so every radius here stays at or under half of what it rounds.
@@ -135,7 +135,41 @@ THEMES: dict[str, Theme] = {
 }
 
 
+def _luminance(color: str) -> float:
+    c = QColor(color)
+    return (0.2126 * c.redF() + 0.7152 * c.greenF() + 0.0722 * c.blueF())
+
+
+def _mix(a: str, b: str, t: float) -> str:
+    ca, cb = QColor(a), QColor(b)
+    channels = (round(x + (y - x) * t) for x, y in ((ca.red(), cb.red()), (ca.green(), cb.green()), (ca.blue(), cb.blue())))
+    return "#{:02X}{:02X}{:02X}".format(*channels)
+
+
+def custom_theme(page: str, text: str) -> Theme:
+    """The Custom theme: the user's paper and ink, with the frame and panels of
+    Original (a light paper) or Dark (a dark one), and a highlighter mixed from the paper."""
+    dark = _luminance(page) < 0.45
+    base = THEMES["dark" if dark else "original"]
+    highlight = _mix(page, "#C77DFF" if dark else "#B05CE0", 0.45 if dark else 0.3)
+    return replace(base, key="custom", name="Custom", page=page, text=text, highlight=highlight,
+                   muted=_mix(text, page, 0.4), partner="dark" if not dark else "original")
+
+
+_custom = custom_theme("#F6F1E7", "#2B2621")
+
+
+def set_custom_colors(page: str, text: str) -> Theme:
+    """The user picked the Custom theme's colors (Settings ▸ Color)."""
+    global _custom
+    if QColor(page).isValid() and QColor(text).isValid():
+        _custom = custom_theme(QColor(page).name(), QColor(text).name())
+    return _custom
+
+
 def theme_for(key: str) -> Theme:
+    if key == "custom":
+        return _custom
     return THEMES.get(key, THEMES["original"])
 
 
@@ -160,10 +194,11 @@ def ui_font(size: float = 13, weight: QFont.Weight = QFont.Weight.Normal) -> QFo
     return font
 
 
-def reading_font(size: float, weight: QFont.Weight = QFont.Weight.Normal) -> QFont:
-    """The book's serif (Iowan Old Style or its first installed fallback)."""
+def reading_font(size: float, weight: QFont.Weight = QFont.Weight.Normal, family: str = "") -> QFont:
+    """The book's serif (Iowan Old Style or its first installed fallback), or the
+    user's preferred family (Settings ▸ Font) with the serif behind it."""
     font = QFont()
-    font.setFamilies(READING_FAMILIES)
+    font.setFamilies([family, *READING_FAMILIES] if family else READING_FAMILIES)
     font.setPointSizeF(size)
     font.setWeight(weight)
     return font
@@ -348,6 +383,9 @@ QMenu::item:disabled {{ color: {t.muted}; }}
 QMenu::separator {{ height: 1px; background: {t.hairline}; margin: 5px 8px; }}
 QMenu::section {{ color: {t.muted}; padding: 6px 12px 2px 12px; }}
 QMenu::indicator {{ width: 14px; left: 7px; }}
+
+QLabel#readingInfo {{ color: {t.muted}; background: {_alpha(t.page, 0.9)}; border: 1px solid {t.hairline};
+           border-radius: 10px; padding: 2px 9px; }}
 
 QLabel#castingTitle, QLabel#alertTitle {{ color: {t.text}; }}
 QLabel#castingSubtitle, QLabel#hint, QLabel#alertText {{ color: {t.muted}; }}

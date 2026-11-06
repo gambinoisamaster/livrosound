@@ -35,6 +35,18 @@ Auto-follow, shared by both views:
   push the sentence being read off screen.
 - keep_in_view re-centers when the sentence leaves the middle FOLLOW_BAND of the view.
 
+Page views (set_page_mode): "scroll" (continuous), "single" or "double" (two
+pages side by side). Paged, each view lays its pages out exactly one viewport
+high, so a page turn is a jump of spread_step() px of the scroll bar (hidden):
+the wheel, ↑/↓, Page Up/Down and Home/End turn pages (one per wheel notch,
+with a short pause so a trackpad flick turns one page, not ten), and
+auto-follow turns to the page holding the sentence instead of scrolling.
+
+ReadingStyle carries the user's text settings (Settings ▸ Font / Layout):
+family, weight, spacing, justification, the margins beside the text and the
+widest the column gets. ReflowView applies all of it; PageView, which shows a
+PDF's own pages, only the margins.
+
 ensure_reading_fonts() makes the book's serif (Iowan Old Style) visible to Qt;
 macOS ships it but hides it from apps. ReflowView calls it; the main window
 should call it at startup too, so every theme.reading_font() (the toolbar's
@@ -43,6 +55,8 @@ book title, the layout previews) gets Iowan rather than the Charter fallback.
 
 from __future__ import annotations
 
+import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPoint, QPropertyAnimation, Qt, Signal
@@ -53,6 +67,9 @@ from livrosound.book import Book
 from livrosound.ui.theme import READING_FAMILIES, Theme
 
 MODES = ("original", "livrosound")  # set_book(book, mode)
+PAGE_MODES = ("scroll", "single", "double")  # set_page_mode(mode)
+WHEEL_NOTCH = 120  # angleDelta of one wheel click: one page turn
+TURN_PAUSE_S = 0.35  # after a page turn, the rest of a trackpad flick is ignored
 _SYSTEM_READING_FONTS = ("/System/Library/Fonts/Supplemental/Iowan Old Style.ttc",)
 FOLLOW_BAND = 0.7  # the middle share of the view the sentence being read stays in
 SCROLL_MS = 450
@@ -77,6 +94,22 @@ def ensure_reading_fonts() -> None:
     for path in _SYSTEM_READING_FONTS:
         if Path(path).is_file():
             QFontDatabase.addApplicationFont(path)
+
+
+@dataclass(frozen=True)
+class ReadingStyle:
+    """How the user wants the text set (Settings ▸ Font and Layout)."""
+
+    family: str = ""  # "" = the reading serif (theme.READING_FAMILIES)
+    weight: int = 400  # CSS weight
+    line_spacing: float = 1.5  # × the font size
+    paragraph_spacing: float = 0.3  # em under a paragraph
+    word_spacing: float = 0.0  # px added between words
+    letter_spacing: float = 0.0  # px added between letters
+    justify: bool = False
+    margin_left: int = -1  # px beside the text; -1 = centered
+    margin_right: int = -1
+    max_column: int = 700  # px
 
 
 def centered_scroll_value(current: int, top: int, bottom: int, viewport_height: int, maximum: int) -> int:
@@ -150,6 +183,21 @@ class ReaderView:
         """The first block visible near the top of the view."""
         raise NotImplementedError
 
+    def set_page_mode(self, mode: str) -> None:
+        """Continuous scroll, single page or double page (one of PAGE_MODES)."""
+        raise NotImplementedError
+
+    def set_style(self, style: ReadingStyle) -> None:
+        raise NotImplementedError
+
+    def page_info(self) -> tuple[int, int, int] | None:
+        """(first page shown, last page shown, pages in all), 1-based; None when not known yet."""
+        raise NotImplementedError
+
+    def spread_step(self) -> int:
+        """Paged: how far (scroll bar px) one page turn goes."""
+        raise NotImplementedError
+
     def hit_test(self, pos: QPoint) -> tuple[int, int] | None:
         """(block, char) under a point of the viewport, or None."""
         raise NotImplementedError
@@ -161,7 +209,38 @@ class ReaderView:
 
     _book: Book | None = None
 
+    _page_mode = "scroll"
+
+    def page_mode(self) -> str:
+        return self._page_mode
+
+    def paged(self) -> bool:
+        return self._page_mode != "scroll"
+
+    def page_step(self, step: int) -> None:
+        """One page (or one screen, scrolling) forward or back, by the user."""
+        self._scrolled_by_hand()
+        bar = self.verticalScrollBar()
+        if self.paged():
+            self.turn_to(bar.value() + step * self.spread_step())
+        else:
+            self.scroll_to_value(bar.value() + step * max(1, bar.pageStep() - 40))
+
+    def turn_to(self, value: int) -> None:
+        """Paged: show the spread holding scroll value `value` (snapped to a page turn)."""
+        step = max(1, self.spread_step())
+        value = max(0, round(value / step) * step)
+        self._allow_value(value)
+        value = min(value, self.verticalScrollBar().maximum() // step * step)
+        self.stop_scrolling()
+        self.verticalScrollBar().setValue(value)
+
+    def _allow_value(self, value: int) -> None:
+        """Paged: let the scroll bar reach `value` (the last spread may start past Qt's maximum)."""
+
     def _init_reader_view(self) -> None:
+        self._wheel = 0
+        self._turned_at = 0.0
         self._scroll_animation: QPropertyAnimation | None = None
         self._press_pos: QPoint | None = None
         self._hover_link = -1
@@ -171,7 +250,11 @@ class ReaderView:
         self.verticalScrollBar().installEventFilter(self._scroll_watcher)
 
     def scroll_to_value(self, target: int, *, animate: bool = True) -> None:
-        """Scroll to a value of the vertical scroll bar, eased (InOutCubic) or at once."""
+        """Scroll to a value of the vertical scroll bar, eased (InOutCubic) or at once.
+        Paged, it turns to the spread holding target, at once."""
+        if self.paged():
+            self.turn_to(target)
+            return
         scrollbar = self.verticalScrollBar()
         self.stop_scrolling()
         target = max(scrollbar.minimum(), min(scrollbar.maximum(), target))
@@ -213,6 +296,18 @@ class ReaderView:
     # ---------- events ----------
 
     def wheelEvent(self, event: QWheelEvent) -> None:
+        if self.paged():
+            event.accept()
+            self._scrolled_by_hand()
+            delta = event.angleDelta().y() or event.pixelDelta().y() * 2
+            if time.monotonic() - self._turned_at < TURN_PAUSE_S:
+                return
+            self._wheel += delta
+            if abs(self._wheel) >= WHEEL_NOTCH:
+                self.page_step(-1 if self._wheel > 0 else 1)
+                self._wheel = 0
+                self._turned_at = time.monotonic()
+            return
         self._scrolled_by_hand()
         self._scroll_watcher.forwarding = True
         try:
@@ -223,6 +318,14 @@ class ReaderView:
     def keyPressEvent(self, event: QKeyEvent) -> None:
         if event.key() in PLAYER_KEYS and not event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier:
             event.ignore()  # the main window's play/pause and ±10 s
+            return
+        if event.key() in SCROLL_KEYS and self.paged():
+            key = event.key()
+            if key in (Qt.Key.Key_Home, Qt.Key.Key_End):
+                self._scrolled_by_hand()
+                self.turn_to(0 if key == Qt.Key.Key_Home else 1 << 30)
+            else:
+                self.page_step(-1 if key in (Qt.Key.Key_Up, Qt.Key.Key_PageUp) else 1)
             return
         if event.key() in SCROLL_KEYS:
             self._scrolled_by_hand()

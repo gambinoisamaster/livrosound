@@ -86,3 +86,28 @@ def split_sentences(text: str, start: int = 0, end: int | None = None) -> list[t
         if a < b:
             trimmed.append((a, b))
     return trimmed or [(start, end)]
+
+
+_WORD_SPAN_RE = re.compile(r"\S+")
+_VOWELS_RE = re.compile(r"[aeiouy]+", re.I)
+
+
+def word_at(text: str, start: int, end: int, fraction: float) -> tuple[int, int]:
+    """The word of text[start:end] being said `fraction` (0..1) of the way through it,
+    for the word-by-word highlighter. Pocket-TTS gives no word timings, so each word
+    is given time for its syllables, and punctuation after it for a breath."""
+    words = [(m.start() + start, m.end() + start, m.group()) for m in _WORD_SPAN_RE.finditer(text[start:end])]
+    if not words:
+        return start, end
+    weights = []
+    for _, _, word in words:
+        syllables = max(1, len(_VOWELS_RE.findall(word)))
+        pause = 1.5 if word[-1] in ".!?;:" else 0.7 if word[-1] in ",—–)" else 0.0
+        weights.append(syllables + 0.6 + pause)
+    target = max(0.0, min(1.0, fraction)) * sum(weights)
+    reached = 0.0
+    for (a, b, _), weight in zip(words, weights):
+        reached += weight
+        if target < reached:
+            return a, b
+    return words[-1][0], words[-1][1]

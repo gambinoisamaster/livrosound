@@ -1360,3 +1360,54 @@ def test_auto_mode_follows_the_appearance(script, monkeypatch):
     window.settings.auto_mode = False
     window._follow_appearance()
     assert window.theme.key == "dark"
+
+
+# ---------- reading settings ----------
+
+
+def test_settings_apply_live_and_the_page_line_shows_progress(script, tmp_path):
+    window, _, _ = script.window()
+    script.voice = None
+    open_book(script, window, write_txt(tmp_path))
+    view = window.view
+    window.settings.always_show_status_bar = True
+    window._change_setting("page_view", "single")
+    assert view.page_mode() == "single"
+    window._count_pages()
+    first, last, total = view.page_info()
+    assert first == 1 and total >= 1
+    assert window.reading_info_text().startswith(f"Page 1 of {total}") and window.reading_info.isVisible()
+    window._change_setting("justify", True)
+    window._change_setting("font_weight", 600)
+    assert view._style.justify and view._style.weight == 600
+    window._change_setting("show_page_numbers", False)
+    assert window.reading_info_text() == "0%"
+    window._change_setting("show_read_percent", False)
+    assert window.reading_info_text() == "" and not window.reading_info.isVisible()
+    window._change_setting("highlight_unit", "paragraph")
+    window._change_setting("theme", "calm")
+    assert window.theme.key == "calm"
+    window._change_setting("custom_page", "#203040")
+    window._change_setting("theme", "custom")
+    assert window.theme.key == "custom" and window.theme.page == "#203040"
+    assert Library.load() is not None and mw.Settings.load().page_view == "single"
+
+
+def test_word_and_paragraph_highlighting_follow_the_audio(script, tmp_path):
+    window, outputs, _ = script.window()
+    script.answers["Generate audio from the beginning?"] = True
+    open_book(script, window, write_txt(tmp_path))
+    wait_until(lambda: window._worker is None)
+    window.settings.highlight_unit = "paragraph"
+    window.toggle_play()
+    play(window, outputs, 200)
+    while cue_at(window.store.info(window.player.position()[0]).cues, window.player.position()[1]) is None:
+        play(window, outputs, 100)  # past the title's breath, into words
+    play(window, outputs, 200)
+    block = window.player.position()[0]
+    assert window._highlight == (block, 0, len(window.book.blocks[block].text))
+    window._change_setting("highlight_unit", "word")
+    play(window, outputs, 100)
+    block, start, end = window._highlight
+    sentence = expected_highlight(window)
+    assert sentence[1] <= start < end <= sentence[2] and " " not in window.book.blocks[block].text[start:end]

@@ -47,6 +47,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QAbstractButton,
     QButtonGroup,
+    QComboBox,
     QCompleter,
     QDialog,
     QFrame,
@@ -55,7 +56,10 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QScrollArea,
     QSlider,
+    QStackedWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -837,3 +841,308 @@ class BookDetailsDialog(_Dialog):
         """The (tags, collections) to keep, or None (Cancel)."""
         dialog = cls(parent, record, tags_in_use, collections_in_use)
         return dialog.names() if dialog.exec() == QDialog.DialogCode.Accepted else None
+
+
+# ---------- Settings ----------
+
+WEIGHTS = {300: "Light", 400: "Regular", 500: "Medium", 600: "Semibold", 700: "Bold"}
+DEFAULT_FONT_LABEL = "Iowan Old Style (default)"
+SHORTCUTS = (
+    ("Space", "Play or pause"),
+    ("← / →", "Back or forward 10 seconds"),
+    ("↑ / ↓, Page Up / Page Down", "Turn the page (single and double page)"),
+    ("⌘F", "Find in the book"),
+    ("⌘G / ⇧⌘G", "Next or previous match"),
+    ("⌘+ / ⌘−", "Larger or smaller text"),
+    ("⌘O", "Upload a new book"),
+    ("⇧⌘L", "Go to Library"),
+    ("⌘,", "Settings"),
+)
+
+
+class SettingsDialog(_Dialog):
+    """Everything the reader can tune, in tabs (Readest's Settings): Font, Layout,
+    Color, Reading, General and Shortcuts. Every change goes into Settings at once
+    and is announced with changed(field) so the window applies it live; the
+    window saves."""
+
+    changed = Signal(str)
+    TABS = ("Font", "Layout", "Color", "Reading", "General", "Shortcuts")
+
+    def __init__(self, parent: QWidget | None, settings: Settings, *, add_font: Callable[[], list[str]] | None = None,
+                 pick_color: Callable[[str, str], str | None] | None = None):
+        super().__init__(parent, "Settings", "")
+        self.subtitle_label.hide()
+        self.setMinimumSize(600, 620)
+        self._settings = settings
+        self._add_font = add_font
+        self._pick_color = pick_color or _pick_color
+        self.controls: dict[str, QWidget] = {}
+        from .widgets import segmented_control
+
+        tabs, self.tab_buttons = segmented_control([(t, t, "") for t in self.TABS], "Font", self.show_tab, self)
+        self.body.addWidget(tabs)
+        self.pages = QStackedWidget()
+        for build in (self._font_tab, self._layout_tab, self._color_tab, self._reading_tab, self._general_tab,
+                      self._shortcuts_tab):
+            page = QWidget()
+            layout = QVBoxLayout(page)
+            layout.setContentsMargins(6, 10, 6, 6)
+            layout.setSpacing(6)
+            build(layout)
+            layout.addStretch(1)
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.Shape.NoFrame)
+            scroll.setWidget(page)
+            self.pages.addWidget(scroll)
+        self.body.addWidget(self.pages, 1)
+        done = _button("Done", "generateAudioButton", default=True)
+        done.clicked.connect(self.accept)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(done)
+        self.body.addLayout(row)
+        self.done_button = done
+
+    @classmethod
+    def ask(cls, parent: QWidget | None, settings: Settings, on_change: Callable[[str], None], **kwargs) -> None:
+        dialog = cls(parent, settings, **kwargs)
+        dialog.changed.connect(on_change)
+        dialog.exec()
+
+    def show_tab(self, name: str) -> None:
+        self.pages.setCurrentIndex(self.TABS.index(name))
+        self.tab_buttons[name].setChecked(True)
+
+    def _set(self, field: str, value) -> None:
+        if getattr(self._settings, field) != value:
+            setattr(self._settings, field, value)
+            self.changed.emit(field)
+
+    # ---------- rows ----------
+
+    def _slider(self, layout: QVBoxLayout, field: str, label: str, low: float, high: float, step: float,
+                show: Callable[[float], str], *, scale: float = 1.0) -> QSlider:
+        """A labeled slider for a numeric setting (value = slider position × step)."""
+        title = QLabel()
+        title.setFont(ui_font(13))
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(round(low / step), round(high / step))
+        slider.setCursor(Qt.CursorShape.PointingHandCursor)
+        slider.setStyleSheet(f"QSlider::sub-page:horizontal {{ background: {ACCENT}; border-radius: 3px; }}")
+        value = getattr(self._settings, field) / scale
+        slider.setValue(round(value / step))
+
+        def moved(position: int):
+            number = position * step
+            title.setText(f"{label}: {show(number)}")
+            kind = type(getattr(self._settings, field))
+            self._set(field, kind(round(number * scale, 3)) if kind is float else kind(round(number * scale)))
+
+        slider.valueChanged.connect(moved)
+        title.setText(f"{label}: {show(slider.value() * step)}")
+        layout.addSpacing(4)
+        layout.addWidget(title)
+        layout.addWidget(slider)
+        self.controls[field] = slider
+        return slider
+
+    def _switch(self, layout: QVBoxLayout, field: str, text: str, hint: str = "") -> ToggleSwitch:
+        row = _SwitchRow(text, bool(getattr(self._settings, field)), hint=hint)
+        row.switch.toggled.connect(lambda on: self._set(field, on))
+        layout.addWidget(row)
+        self.controls[field] = row.switch
+        return row.switch
+
+    def _segments(self, layout: QVBoxLayout, field: str, label: str, choices) -> dict[str, QToolButton]:
+        from .widgets import segmented_control
+
+        caption = QLabel(label)
+        caption.setFont(ui_font(13))
+        layout.addSpacing(4)
+        layout.addWidget(caption)
+        frame, buttons = segmented_control(choices, getattr(self._settings, field), lambda k: self._set(field, k), self)
+        layout.addWidget(frame)
+        self.controls[field] = frame
+        return buttons
+
+    # ---------- tabs ----------
+
+    def _font_tab(self, layout: QVBoxLayout) -> None:
+        from . import fonts
+
+        caption = QLabel("Font")
+        caption.setFont(ui_font(13))
+        layout.addWidget(caption)
+        row = QHBoxLayout()
+        self.font_combo = QComboBox()
+        self.font_combo.setFont(ui_font(13))
+        self._fill_fonts(fonts.families())
+        self.font_combo.currentIndexChanged.connect(
+            lambda _i: self._set("font_family", self.font_combo.currentData() or "")
+        )
+        add = _button("Add Font…", "secondaryButton")
+        add.setToolTip("Use a font file of your own (.ttf, .otf, .ttc)")
+        add.clicked.connect(self._on_add_font)
+        add.setEnabled(self._add_font is not None)
+        row.addWidget(self.font_combo, 1)
+        row.addWidget(add)
+        layout.addLayout(row)
+        self.add_font_button = add
+        self.font_sample = QLabel("The quick brown fox jumps over the lazy dog.")
+        self.font_sample.setWordWrap(True)
+        layout.addWidget(self.font_sample)
+        self._slider(layout, "font_weight", "Weight", 300, 700, 100, lambda v: WEIGHTS.get(round(v), str(round(v))))
+        self._slider(layout, "reflow_font_size", "Size", 12, 40, 1, lambda v: f"{v:g} pt")
+        self.changed.connect(lambda field: self._show_sample() if field.startswith("font") or field == "reflow_font_size" else None)
+        self._show_sample()
+
+    def _fill_fonts(self, names: list[str]) -> None:
+        self.font_combo.blockSignals(True)
+        self.font_combo.clear()
+        self.font_combo.addItem(DEFAULT_FONT_LABEL, "")
+        for name in names:
+            self.font_combo.addItem(name, name)
+        index = self.font_combo.findData(self._settings.font_family)
+        self.font_combo.setCurrentIndex(max(0, index))
+        self.font_combo.blockSignals(False)
+
+    def _show_sample(self) -> None:
+        s = self._settings
+        self.font_sample.setFont(reading_font(min(28, s.reflow_font_size), QFont.Weight(s.font_weight), s.font_family))
+
+    def _on_add_font(self) -> None:
+        from . import fonts
+
+        added = self._add_font() if self._add_font is not None else []
+        if added:
+            self._fill_fonts(sorted(set(fonts.families()) | set(added), key=str.casefold))
+            self.font_combo.setCurrentIndex(max(0, self.font_combo.findData(added[0])))
+
+    def _layout_tab(self, layout: QVBoxLayout) -> None:
+        from .widgets import PAGE_VIEWS
+
+        self._segments(layout, "page_view", "Page view", PAGE_VIEWS)
+        self._slider(layout, "line_spacing", "Line spacing", 1.0, 2.6, 0.1, lambda v: f"{v:.1f}×")
+        self._slider(layout, "paragraph_spacing", "Paragraph spacing", 0.0, 2.0, 0.1, lambda v: f"{v:.1f} em")
+        self._slider(layout, "word_spacing", "Word spacing", 0, 12, 1, lambda v: f"+{v:g} px" if v else "normal")
+        self._slider(layout, "letter_spacing", "Letter spacing", 0, 4, 0.5, lambda v: f"+{v:g} px" if v else "normal")
+        self._switch(layout, "justify", "Justify paragraphs", "Even right edges, like a printed page.")
+        centered = _SwitchRow("Center the text", self._settings.margin_left < 0 and self._settings.margin_right < 0,
+                              hint="Turn off to set the left and right margins yourself.")
+        layout.addWidget(centered)
+        self.controls["centered"] = centered.switch
+        sliders = []
+        for field, label in (("margin_left", "Left margin"), ("margin_right", "Right margin")):
+            slider = self._slider(layout, field, label, 0, 400, 4, lambda v: f"{v:g} px")
+            sliders.append((field, slider))
+
+        def center(on: bool):
+            for field, slider in sliders:
+                slider.setEnabled(not on)
+                if on:
+                    self._set(field, -1)
+                else:
+                    self._set(field, max(0, slider.value() * 4) or 64)
+
+        centered.switch.toggled.connect(center)
+        for field, slider in sliders:
+            slider.setEnabled(not centered.switch.isChecked())
+            if getattr(self._settings, field) < 0:
+                slider.blockSignals(True)
+                slider.setValue(16)
+                slider.blockSignals(False)
+        self._slider(layout, "max_column", "Widest text column", 400, 1600, 20, lambda v: f"{v:g} px")
+
+    def _color_tab(self, layout: QVBoxLayout) -> None:
+        from .widgets import ThemeCard
+
+        grid = QGridLayout()
+        grid.setSpacing(10)
+        group = QButtonGroup(self)
+        self.theme_cards: dict[str, ThemeCard] = {}
+        for i, key in enumerate([*themes.THEMES, "custom"]):
+            card = ThemeCard(key)
+            card.setChecked(key == self._settings.theme)
+            card.clicked.connect(lambda _=False, k=key: self._set("theme", k))
+            group.addButton(card)
+            grid.addWidget(card, i // 3, i % 3)
+            self.theme_cards[key] = card
+        layout.addLayout(grid)
+        row = QHBoxLayout()
+        caption = QLabel("Custom theme")
+        caption.setFont(ui_font(13))
+        row.addWidget(caption)
+        row.addStretch(1)
+        for field, label in (("custom_page", "Paper…"), ("custom_text", "Text…")):
+            button = _button(label, "secondaryButton")
+            button.clicked.connect(lambda _=False, f=field, t=label: self._choose_color(f, t))
+            row.addWidget(button)
+            self.controls[field] = button
+        layout.addLayout(row)
+        layout.addWidget(_hairline_frame())
+        self._switch(layout, "auto_mode", "Auto Mode", "Follow macOS: one theme in Light appearance, another in Dark.")
+        for field, label in (("light_theme", "In Light appearance"), ("dark_theme", "In Dark appearance")):
+            row = QHBoxLayout()
+            name = QLabel(label)
+            name.setFont(ui_font(13))
+            combo = QComboBox()
+            for key in [*themes.THEMES, "custom"]:
+                combo.addItem(themes.theme_for(key).name, key)
+            combo.setCurrentIndex(max(0, combo.findData(getattr(self._settings, field))))
+            combo.currentIndexChanged.connect(lambda _i, f=field, c=combo: self._set(f, c.currentData()))
+            row.addWidget(name)
+            row.addStretch(1)
+            row.addWidget(combo)
+            layout.addLayout(row)
+            self.controls[field] = combo
+
+    def _choose_color(self, field: str, title: str) -> None:
+        color = self._pick_color(getattr(self._settings, field), title.rstrip("…"))
+        if color:
+            self._set(field, color)
+            for card in self.theme_cards.values():
+                card.update()
+
+    def _reading_tab(self, layout: QVBoxLayout) -> None:
+        from .widgets import HIGHLIGHT_UNITS
+
+        self._switch(layout, "highlight", "Highlight while reading")
+        self._segments(layout, "highlight_unit", "Highlighter", HIGHLIGHT_UNITS)
+        layout.addWidget(_hint("Word by word follows the narrator's timing within each sentence (an estimate).", 11))
+        self._switch(layout, "show_page_numbers", "Show page numbers")
+        self._switch(layout, "show_read_percent", "Show how much you've read")
+        self._switch(layout, "always_show_status_bar", "Always show the status bar",
+                     "Otherwise the page and progress fade while you read.")
+
+    def _general_tab(self, layout: QVBoxLayout) -> None:
+        self._switch(layout, "open_last_book", "Open last book on start", "Skip the start page and continue reading.")
+        self._switch(layout, "auto_import", "Auto import on file open",
+                     "A book opened with LivroSound from Finder, or dropped on its window, joins your library at once.")
+
+    def _shortcuts_tab(self, layout: QVBoxLayout) -> None:
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(24)
+        grid.setVerticalSpacing(10)
+        for row, (keys, action) in enumerate(SHORTCUTS):
+            key = QLabel(keys)
+            key.setFont(ui_font(13, QFont.Weight.DemiBold))
+            grid.addWidget(key, row, 0)
+            grid.addWidget(QLabel(action), row, 1)
+        grid.setColumnStretch(1, 1)
+        layout.addLayout(grid)
+
+
+def _hairline_frame() -> QFrame:
+    line = QFrame()
+    line.setObjectName("hairline")
+    line.setFixedHeight(1)
+    return line
+
+
+def _pick_color(current: str, title: str) -> str | None:
+    from PySide6.QtWidgets import QColorDialog
+
+    color = QColorDialog.getColor(QColor(current), None, title)
+    return color.name() if color.isValid() else None

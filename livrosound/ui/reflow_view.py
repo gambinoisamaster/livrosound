@@ -45,23 +45,39 @@ Rules that are easy to break:
   when jumping far ahead, and check Qt's hit test against block geometry.
 - The original HTML's text and background colors are dropped: the theme
   colors the page.
+- The user's ReadingStyle (font family and weight, line, paragraph, word and
+  letter spacing, justification) sets the LivroSound layout; the margins and
+  the widest column apply to both layouts.
+- Paged (single or double page), the document is laid out with Qt's own
+  pagination (QTextDocument.setPageSize: no line ever straddles a page edge),
+  each page exactly one viewport high, and the scroll bar moves a page (or a
+  spread of two) at a time. QTextEdit drops the page height whenever it
+  re-wraps, so _paginate() puts it back after every rebuild and resize. Double
+  page lays the text out at one page's width and paints page 2k on the left
+  and 2k+1 on the right itself; mouse events on the right page are moved to
+  where that page sits in the document, so selecting and clicking work there
+  as everywhere else.
 """
 
 from __future__ import annotations
 
 import bisect
+import math
 import re
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QPoint, QSize, Qt, QUrl
+from PySide6.QtCore import QPoint, QPointF, QRectF, QSize, QSizeF, Qt, QUrl
 from PySide6.QtGui import (
+    QAbstractTextDocumentLayout,
     QColor,
     QFont,
     QFontDatabase,
     QFontMetricsF,
     QGuiApplication,
     QImageReader,
+    QMouseEvent,
+    QPainter,
     QPalette,
     QTextBlockFormat,
     QTextCharFormat,
@@ -77,7 +93,9 @@ from livrosound.book import ANCHOR_PREFIX, Block, Book
 from livrosound.ui import theme as themes
 from livrosound.ui.reader_view import (
     MODES,
+    PAGE_MODES,
     ReaderView,
+    ReadingStyle,
     centered_scroll_value,
     ensure_reading_fonts,
     outside_band,
@@ -92,7 +110,9 @@ MIN_MARGIN = 24  # px beside the column on a narrow window
 COLUMN_PADDING = 22  # px inside the column, so a highlight never touches its edge
 TOP_PADDING = 56
 BOTTOM_PADDING = 160
-LINE_HEIGHT = 1.5  # × the font size
+PAGED_TOP = 40  # px above the text on each page
+PAGED_BOTTOM = 104  # px under it: clear of the player floating over the page's foot
+PAGE_GUTTER = 64  # px between the two pages of a spread
 HEADING_SCALE = {1: 1.6, 2: 1.25}  # deeper levels: 1.1
 MAX_IMAGE_HEIGHT = 600  # px: a cover fits a typical window
 SEPARATOR = "\u2042"  # ⁂
@@ -339,8 +359,13 @@ class ReflowView(ReaderView, QTextEdit):
         self._muted: list[tuple[int, int]] = []  # LivroSound layout: document ranges in the muted color
         self._column = 0  # the viewport's width: the text column plus its padding
         self._highlight: tuple[int, int, int] | None = None  # (block, start, end)
+        self._style = ReadingStyle()
+        self._page_height = 0  # paged: the height of a page (the viewport's)
+        self._total_pages: int | None = None  # counted on demand (it lays the whole book out)
         self._init_reader_view()
         self.set_theme(self._theme)
+        self.selectionChanged.connect(self._repaint_if_double)
+        self.verticalScrollBar().rangeChanged.connect(lambda *_: self._allow_value(0))
 
     # ---------- ReaderView ----------
 
@@ -393,16 +418,92 @@ class ReflowView(ReaderView, QTextEdit):
         self._size = size
         if self._book is None:
             return
-        top = self._locate(self._position_at(QPoint(0, 0)))
+        top = self._top()
         if self._mode == "original":
-            self.document().setDefaultFont(themes.reading_font(size))
+            self.document().setDefaultFont(self._body_font())
+            self._paginate()
         else:
             self._rebuild()
-        if top is not None:  # keep the line that was at the top there
-            position = self._doc_pos(*top)
-            target = self.verticalScrollBar().value() + self.cursorRect(self._cursor(position)).top()
-            self._reach(target, position)
-            self.scroll_to_value(target, animate=False)
+        self._restore_top(top)
+
+    def set_style(self, style: ReadingStyle) -> None:
+        """The user's text settings. Margins and the column width re-wrap the text; the
+        rest re-sets the LivroSound layout (the original layout keeps its own type)."""
+        if style == self._style:
+            return
+        old, self._style = self._style, style
+        if self._book is None:
+            return
+        top = self._top()
+        typeset = (old.family, old.weight, old.line_spacing, old.paragraph_spacing, old.word_spacing,
+                   old.letter_spacing, old.justify)
+        if typeset != (style.family, style.weight, style.line_spacing, style.paragraph_spacing,
+                       style.word_spacing, style.letter_spacing, style.justify):
+            if self._mode == "original":
+                self.document().setDefaultFont(self._body_font())
+            else:
+                self._rebuild()
+        self._update_geometry()
+        self._paginate()
+        self._restore_top(top)
+
+    def set_page_mode(self, mode: str) -> None:
+        if mode not in PAGE_MODES:
+            raise ValueError(f"unknown page mode {mode!r}")
+        if mode == self._page_mode:
+            return
+        top = self._top() if self._book is not None else None
+        self._page_mode = mode
+        self.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOn if mode == "scroll" else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self._pad(self.document())
+        self._total_pages = None
+        self._update_geometry()
+        self._paginate()
+        self._restore_top(top)
+        self.viewport().update()
+
+    def spread_step(self) -> int:
+        return max(1, self._page_height) * (2 if self._page_mode == "double" else 1)
+
+    def page_info(self) -> tuple[int, int, int] | None:
+        """Pages are screens of text while scrolling. The total comes from count_pages()."""
+        if self._book is None or self._total_pages is None:
+            return None
+        height = self._page_height if self.paged() else max(1, self.viewport().height())
+        first = self.verticalScrollBar().value() // max(1, height) + 1
+        last = first + 1 if self._page_mode == "double" else first
+        total = self._total_pages
+        return min(first, total), min(last, total), total
+
+    def count_pages(self) -> int:
+        """Lay the whole book out (≈0.7 s for Anna Karenina) and count its pages."""
+        if self._total_pages is None and self._book is not None:
+            doc = self.document()
+            if self.paged():
+                self._total_pages = max(1, doc.pageCount())
+            else:
+                layout = doc.documentLayout()
+                layout.blockBoundingRect(doc.lastBlock())  # finishes the lazy layout
+                height = layout.documentSize().height()
+                self._total_pages = max(1, math.ceil(height / max(1, self.viewport().height())))
+        return self._total_pages or 0
+
+    def _top(self) -> tuple[int, int] | None:
+        """(block, char) at the top of the page (to keep the reader's place)."""
+        return self._locate(self._position_at(QPoint(self._column // 2, PAGED_TOP + 4 if self.paged() else 0)))
+
+    def _restore_top(self, top: tuple[int, int] | None) -> None:
+        if top is None:
+            return
+        position = self._doc_pos(*top)
+        if self.paged():
+            self._show_page_of(position)
+            return
+        target = self.verticalScrollBar().value() + self.cursorRect(self._cursor(position)).top()
+        self._reach(target, position)
+        self.scroll_to_value(target, animate=False)
 
     def show_highlight(self, block: int, start: int, end: int) -> None:
         if self._book is None or not 0 <= block < len(self._book.blocks) or self._book.blocks[block].skipped:
@@ -430,6 +531,10 @@ class ReflowView(ReaderView, QTextEdit):
             else:
                 start = self._doc_pos(block, char)
                 end = start + 1
+        if self.paged():
+            runs = self._runs(*self._highlight) if self._highlight and self._highlight[0] == block else []
+            self._show_page_of(runs[0][0] if runs else self._doc_pos(block, char))
+            return
         self._center(start, end, animate)
 
     def keep_in_view(self, block: int, start: int, end: int) -> None:
@@ -443,13 +548,18 @@ class ReflowView(ReaderView, QTextEdit):
         else:
             first = self._doc_pos(block, start)
             last = first + 1
+        if self.paged():
+            if self._page_of(first) not in self._pages_shown():
+                self._show_page_of(first)
+            return
         top, bottom = self._span(first, last)
         shift = self.verticalScrollBar().value() - self.scroll_target()
         if outside_band(top + shift, bottom + shift, self.viewport().height()):
             self._center(first, last, True)
 
     def current_block(self) -> int:
-        hit = self._locate(self._position_at(QPoint(self.viewport().width() // 2, _TOP_PROBE)))
+        y = PAGED_TOP + _TOP_PROBE if self.paged() else _TOP_PROBE
+        hit = self._locate(self._position_at(QPoint(self._column // 2, y)))
         return hit[0] if hit else 0
 
     def hit_test(self, pos: QPoint) -> tuple[int, int] | None:
@@ -479,29 +589,35 @@ class ReflowView(ReaderView, QTextEdit):
         self.setDocument(doc)
         if ours:
             old.deleteLater()
+        self._total_pages = None
+        self._paginate()
         self._refresh_selections()  # the old ones point into the old document
 
     def _new_document(self) -> QTextDocument:
         doc = QTextDocument(self)
         doc.setUndoRedoEnabled(False)
         doc.setDocumentMargin(0)
-        doc.setDefaultFont(themes.reading_font(self._size))
+        doc.setDefaultFont(self._body_font())
         return doc
 
-    @staticmethod
-    def _pad(doc: QTextDocument) -> None:
+    def _body_font(self) -> QFont:
+        return themes.reading_font(self._size, QFont.Weight(self._style.weight), self._style.family)
+
+    def _pad(self, doc: QTextDocument) -> None:
+        """The padding around the text: per page when paged (Qt repeats the root
+        frame's top and bottom margins on every page)."""
         frame = doc.rootFrame()
         fmt = frame.frameFormat()
         fmt.setLeftMargin(COLUMN_PADDING)
         fmt.setRightMargin(COLUMN_PADDING)
-        fmt.setTopMargin(TOP_PADDING)
-        fmt.setBottomMargin(BOTTOM_PADDING)
+        fmt.setTopMargin(PAGED_TOP if self.paged() else TOP_PADDING)
+        fmt.setBottomMargin(PAGED_BOTTOM if self.paged() else BOTTOM_PADDING)
         frame.setFrameFormat(fmt)
 
     def _reflow_document(self, book: Book) -> QTextDocument:
         doc = self._new_document()
         self._pad(doc)
-        styles = _ReflowStyles(self._size, self._theme.muted)
+        styles = _ReflowStyles(self._size, self._theme.muted, self._style)
         res = paths.book_dir(book.book_id) / "res"
         n = len(book.blocks)
         lengths = [len(b.text) for b in book.blocks]
@@ -567,7 +683,7 @@ class ReflowView(ReaderView, QTextEdit):
         doc = self._new_document()
         doc.setBaseUrl(QUrl.fromLocalFile(str(folder) + "/"))
         doc.setDefaultStyleSheet(_ORIGINAL_DEFAULTS)
-        doc.setHtml(prepare_original_html(book.original_html, _ReflowStyles(self._size, "").em))
+        doc.setHtml(prepare_original_html(book.original_html, _ReflowStyles(self._size, "", self._style).em))
         self._pad(doc)
         anchors, self._images = self._scan(doc, folder)
         self._fit_images(doc)
@@ -793,6 +909,7 @@ class ReflowView(ReaderView, QTextEdit):
             text = self._book.blocks[self._hover_link].text
             selections += [self._selection(a, b, fmt) for a, b in self._runs(self._hover_link, 0, len(text))]
         self.setExtraSelections(selections)
+        self._repaint_if_double()
 
     # ---------- events ----------
 
@@ -803,18 +920,165 @@ class ReflowView(ReaderView, QTextEdit):
         super().wheelEvent(event)
 
     def resizeEvent(self, event) -> None:
-        bar = self.verticalScrollBar().sizeHint().width()
+        self._update_geometry()
+        super().resizeEvent(event)
+        if event.size().height() != event.oldSize().height():
+            self._total_pages = None  # a screen (or a page) holds more or less now
+        self._paginate()
+
+    def _update_geometry(self) -> None:
+        """The text column (or the two pages of a spread) and the margins beside it:
+        the user's margins where set, centered otherwise, never wider than max_column."""
+        style = self._style
+        double = self._page_mode == "double"
+        bar = 0 if self.paged() else self.verticalScrollBar().sizeHint().width()
         available = self.width() - bar
-        column = max(160, min(MAX_COLUMN, available - 2 * MIN_MARGIN))
-        left = max(0, (self.width() - column) // 2)
-        self.setViewportMargins(left, 0, max(0, available - column - left), 0)
+        left_margin = style.margin_left if style.margin_left >= 0 else MIN_MARGIN
+        right_margin = style.margin_right if style.margin_right >= 0 else MIN_MARGIN
+        gutter = PAGE_GUTTER if double else 0
+        room = available - left_margin - right_margin - gutter
+        column = max(160, min(style.max_column, room // (2 if double else 1)))
+        used = column * (2 if double else 1) + gutter
+        if style.margin_left < 0 and style.margin_right < 0:
+            left = max(0, (self.width() - used) // 2)
+        else:
+            left = left_margin + max(0, available - left_margin - right_margin - used) // 2
+        self.setViewportMargins(left, 0, max(0, available - used - left), 0)
         if column != self._column:
             # The document is laid out at the column's width, so only a new column
             # width re-lays out the book (QTextEdit would on every change of the window's width).
             self._column = column
             self._fit_images(self.document())
             self.setLineWrapColumnOrWidth(column)
-        super().resizeEvent(event)
+            self._total_pages = None
+
+    # ---------- pages ----------
+
+    def _paginate(self) -> None:
+        """Paged: lay the document out in pages one viewport high (QTextEdit forgets the
+        page height whenever it re-wraps). Scrolling: no pages."""
+        doc = self.document()
+        height = self.viewport().height() if self.paged() else -1
+        if self.paged() and height <= 0:
+            return
+        size = QSizeF(self._column or doc.pageSize().width(), height)
+        if doc.pageSize() != size:
+            doc.setPageSize(size)
+            self._total_pages = None
+        self._page_height = max(0, height)
+        if self.paged():
+            self.turn_to(self.verticalScrollBar().value())
+
+    def _allow_value(self, value: int) -> None:
+        """Paged: the last spread starts past Qt's scroll maximum when the last page is
+        short; widen the range to it (and to `value`, a page that may not be laid out yet)."""
+        if not self.paged() or self._page_height <= 0:
+            return
+        bar = self.verticalScrollBar()
+        height = self.document().documentLayout().documentSize().height()
+        last_page = max(0, math.ceil(height / self._page_height) - 1)
+        step = self.spread_step()
+        last = last_page * self._page_height // step * step
+        target = max(last, min(value, (last_page + 1) * self._page_height))
+        if bar.maximum() < target:
+            bar.setMaximum(target)
+
+    def _page_of(self, position: int) -> int:
+        """The page (0-based) a document position is laid out on."""
+        cursor = self._cursor(position)
+        block = cursor.block()
+        rect = self.document().documentLayout().blockBoundingRect(block)
+        line = block.layout().lineForTextPosition(cursor.positionInBlock())
+        y = rect.top() + (line.y() + line.height() / 2 if line.isValid() else 0)
+        return int(y // max(1, self._page_height))
+
+    def _pages_shown(self) -> range:
+        first = self.verticalScrollBar().value() // max(1, self._page_height)
+        return range(first, first + (2 if self._page_mode == "double" else 1))
+
+    def _show_page_of(self, position: int) -> None:
+        """Turn to the spread holding a document position."""
+        page = self._page_of(position)
+        self.turn_to(page * self._page_height)
+
+    def _repaint_if_double(self) -> None:
+        if self._page_mode == "double":
+            self.viewport().update()
+
+    def scrollContentsBy(self, dx: int, dy: int) -> None:
+        if self._page_mode == "double":
+            self.viewport().update()  # both pages change: nothing to move by blitting
+            return
+        super().scrollContentsBy(dx, dy)
+
+    def paintEvent(self, event) -> None:
+        if self._page_mode != "double":
+            super().paintEvent(event)
+            return
+        painter = QPainter(self.viewport())
+        painter.fillRect(self.viewport().rect(), QColor(self._theme.page))
+        height = self._page_height
+        top = self.verticalScrollBar().value()
+        context = QAbstractTextDocumentLayout.PaintContext()
+        context.palette = self.palette()
+        selections = []
+        for extra in self.extraSelections():
+            selection = QAbstractTextDocumentLayout.Selection()
+            selection.cursor, selection.format = extra.cursor, extra.format
+            selections.append(selection)
+        cursor = self.textCursor()
+        if cursor.hasSelection():
+            selection = QAbstractTextDocumentLayout.Selection()
+            selection.cursor = cursor
+            fmt = QTextCharFormat()
+            fmt.setBackground(self.palette().color(QPalette.ColorRole.Highlight))
+            fmt.setForeground(self.palette().color(QPalette.ColorRole.HighlightedText))
+            selection.format = fmt
+            selections.append(selection)
+        context.selections = selections
+        layout = self.document().documentLayout()
+        for i in range(2):
+            y = top + i * height
+            painter.save()
+            painter.translate(i * (self._column + PAGE_GUTTER), -y)
+            clip = QRectF(0, y, self._column, height)
+            painter.setClipRect(clip)
+            context.clip = clip
+            layout.draw(painter, context)
+            painter.restore()
+        spine = QColor(self._theme.text)
+        spine.setAlphaF(0.08)
+        x = self._column + PAGE_GUTTER / 2
+        painter.fillRect(QRectF(x - 0.5, PAGED_TOP, 1, max(0, height - PAGED_TOP - PAGED_BOTTOM)), spine)
+        painter.end()
+
+    def _in_flow(self, event: QMouseEvent) -> QMouseEvent:
+        """Double page: an event on the right page, moved to where that page sits in the
+        document's single column (one page height further down)."""
+        if self._page_mode != "double" or event.position().x() < self._column + PAGE_GUTTER / 2:
+            return event
+        shift = QPointF(-(self._column + PAGE_GUTTER), self._page_height)
+        return QMouseEvent(
+            event.type(), event.position() + shift, event.scenePosition(), event.globalPosition(),
+            event.button(), event.buttons(), event.modifiers(),
+        )
+
+    def mousePressEvent(self, event) -> None:
+        super().mousePressEvent(self._in_flow(event))
+        self._repaint_if_double()
+
+    def mouseMoveEvent(self, event) -> None:
+        super().mouseMoveEvent(self._in_flow(event))
+        self._repaint_if_double()
+
+    def mouseReleaseEvent(self, event) -> None:
+        super().mouseReleaseEvent(self._in_flow(event))
+        if self.paged():
+            self.turn_to(self.verticalScrollBar().value())  # a drag may have scrolled by lines
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        super().mouseDoubleClickEvent(self._in_flow(event))
+        self._repaint_if_double()
 
 
 _FONTS_LOADED: set[str] = set()  # a book's embedded fonts, registered once per run
@@ -824,14 +1088,15 @@ _AS_LINE_SEPARATORS = str.maketrans({"\n": "\u2028", "\r": "\u2028", "\u2029": "
 class _ReflowStyles:
     """Block and char formats of the LivroSound layout at one text size."""
 
-    def __init__(self, size: float, muted: str):
+    def __init__(self, size: float, muted: str, style: ReadingStyle | None = None):
         self.size = size
         self.muted = muted
-        body = themes.reading_font(size)
+        self.style = style or ReadingStyle()
+        body = themes.reading_font(size, QFont.Weight(self.style.weight), self.style.family)
         dpi = QGuiApplication.primaryScreen().logicalDotsPerInchY() if QGuiApplication.primaryScreen() else 72.0
         self.em = size * dpi / 72  # px
         # Qt's proportional line height is a share of the font's natural line height.
-        self.line_percent = round(100 * LINE_HEIGHT * self.em / QFontMetricsF(body).height())
+        self.line_percent = round(100 * self.style.line_spacing * self.em / QFontMetricsF(body).height())
         self._char_cache: dict[tuple, QTextCharFormat] = {}
 
     def formats(self, block: Block, previous: Block | None) -> tuple[QTextBlockFormat, QTextCharFormat]:
@@ -875,7 +1140,7 @@ class _ReflowStyles:
             muted = True
             fmt.setTopMargin(em * 0.3)
         else:  # paragraph
-            fmt.setBottomMargin(em * 0.3)
+            fmt.setBottomMargin(em * self.style.paragraph_spacing)
             # Indented only when it follows a paragraph: never at the top of a chapter,
             # after a scene break or an image, or after an epigraph or quote. Lines of
             # a contents page are never indented.
@@ -884,6 +1149,8 @@ class _ReflowStyles:
                 fmt.setTextIndent(em * 1.4)
         if kind in ("paragraph", "quote", "verse", "note") and block.align:
             fmt.setAlignment(_ALIGN.get(block.align, Qt.AlignmentFlag.AlignLeft))
+        if self.style.justify and kind in ("paragraph", "quote", "note") and block.align in ("", "left", "justify"):
+            fmt.setAlignment(Qt.AlignmentFlag.AlignJustify)
         return fmt, self._char_format(scale, weight, muted)
 
     def runs(self, block: Block, base: QTextCharFormat) -> list[tuple[int, int, QTextCharFormat]]:
@@ -910,7 +1177,7 @@ class _ReflowStyles:
         if "i" in active:
             fmt.setFontItalic(True)
         if "b" in active:
-            fmt.setFontWeight(QFont.Weight.Bold)
+            fmt.setFontWeight(QFont.Weight(min(900, max(700, self.style.weight + 300))))
         if "sc" in active:
             # Iowan's own small caps (OpenType smcp): Qt's synthesized ones drop to a
             # fallback sans in every document after the first.
@@ -927,7 +1194,12 @@ class _ReflowStyles:
             if scale != 1.0:
                 fmt.setFontPointSize(self.size * scale)
             if weight != QFont.Weight.Normal:
-                fmt.setFontWeight(weight)
+                fmt.setFontWeight(QFont.Weight(max(int(weight.value), self.style.weight + 200)))
+            if self.style.word_spacing:
+                fmt.setFontWordSpacing(self.style.word_spacing)
+            if self.style.letter_spacing:
+                fmt.setFontLetterSpacingType(QFont.SpacingType.AbsoluteSpacing)
+                fmt.setFontLetterSpacing(self.style.letter_spacing)
             if muted:
                 fmt.setForeground(QColor(self.muted))
             self._char_cache[key] = fmt
